@@ -26,3 +26,7 @@ Thumbs.db
 coverage/
 
 .claude/
+
+# GCP Service Account credentials
+ai-onboarding-v2-*.json
+*-service-account*.json
