@@ -2,6 +2,7 @@ import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import Login from './pages/Login';
 import RequirementConfig from './pages/RequirementConfig';
 import OnboardVerification from './pages/OnboardVerification';
+import MerchantAnalysis from './pages/MerchantAnalysis';
 import ProtectedRoute from './components/ProtectedRoute';
 
 function App() {
@@ -16,6 +17,14 @@ function App() {
           element={
             <ProtectedRoute>
               <OnboardVerification />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/merchant-analysis"
+          element={
+            <ProtectedRoute>
+              <MerchantAnalysis />
             </ProtectedRoute>
           }
         />

@@ -32,7 +32,11 @@ const login = async (req, res) => {
       user: { id: user.id, name: user.name, email: user.email },
     });
   } catch (err) {
-    console.error('Login error:', err);
+    console.error('=== LOGIN ERROR ===');
+    console.error('Message :', err.message);
+    console.error('Code    :', err.code);
+    console.error('Stack   :', err.stack);
+    console.error('===================');
     return res.status(500).json({ message: 'Server error.' });
   }
 };

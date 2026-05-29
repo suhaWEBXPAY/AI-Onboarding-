@@ -1,6 +1,5 @@
 import { useState, useEffect } from 'react';
-import Navbar from '../components/Navbar';
-import Sidebar from '../components/Sidebar';
+import PageLayout from '../components/PageLayout';
 import api from '../services/api';
 
 // ─── helpers ───────────────────────────────────────────────
@@ -127,15 +126,11 @@ function RequirementConfig() {
 
   // ──────────────────────────────────────────────────────────
   return (
-    <div className="app-shell">
-      <Navbar />
-      <div className="app-body">
-        <Sidebar />
-        <main className="main-content">
+    <PageLayout>
 
           <div className="page-header">
             <h1 className="page-title">Requirement Configuration</h1>
-            <p className="page-subtitle">Define merchant types, configure onboarding requirements, and set document fields</p>
+            <p className="page-subtitle">Define merchant types and configure required onboarding documents</p>
           </div>
 
           {/* ══════════════════════════════════════════
@@ -368,9 +363,7 @@ function RequirementConfig() {
             </div>
           </div>
 
-        </main>
-      </div>
-    </div>
+    </PageLayout>
   );
 }
 

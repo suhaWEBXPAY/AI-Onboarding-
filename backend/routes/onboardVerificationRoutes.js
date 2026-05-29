@@ -7,6 +7,9 @@ const {
   getRequirements, getAllMerchants, saveMerchant,
   uploadDocument, uploadUrl, getDocuments,
   getMerchant, deleteMerchant, deleteDocument,
+  runDataVerification, fetchExternalMerchant, runAiAnalysis, getLatestAnalysis,
+  runFullApiVerification, getAiUsage,
+  triggerAutoRun, getAutoRunStatusHandler,
 } = require('../controllers/onboardVerificationController');
 
 const upload = multer({
@@ -28,5 +31,13 @@ router.post('/upload',                      protect, upload.single('file'), uplo
 router.post('/upload-url',                  protect, uploadUrl);
 router.get('/documents/:mid',               protect, getDocuments);
 router.delete('/document/:id',              protect, deleteDocument);
+router.post('/verify-data',                 protect, runDataVerification);
+router.get('/external-merchant/:mid',       protect, fetchExternalMerchant);
+router.post('/verify-mid/:mid',            protect, runFullApiVerification);
+router.post('/analyze/:mid',               protect, runAiAnalysis);
+router.get('/latest-analysis/:mid',        protect, getLatestAnalysis);
+router.get('/ai-usage',                    protect, getAiUsage);
+router.post('/auto-run',                   protect, triggerAutoRun);
+router.get('/auto-run-status',             protect, getAutoRunStatusHandler);
 
 module.exports = router;
