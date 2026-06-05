@@ -1,9 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const fetch = require('node-fetch');
-const { isOverBudget, getRemainingBudget, recordUsage } = require('./costTracker');
-
-const AI_BUDGET_USD = Number(process.env.AI_BUDGET_USD || 0.50);
+const { recordUsage } = require('./costTracker');
 const WEBXPAY_BASE = 'https://signup.webxpay.com';
 const PROMPT_FILE = process.env.DOCUMENT_PROMPT_FILE
   || path.join(__dirname, '../../prompts/merchant_verification_prompt.md');
@@ -25,8 +23,16 @@ const DOC_NAME_TO_TITLE = {
   form_one_or_forty: 'Form 01 / Form 40',
   articles_of_association: 'Articles of Association',
   board_resolution: 'Board Resolution',
-  duly_filled_agreement: 'Duly Filled Agreement',
 };
+
+// Documents that must never be sent to the AI — skipped at extraction time.
+const SKIP_DOC_PATTERNS = [
+  /duly.?filled.?agreement/i,
+  /duly.?filled/i,
+];
+
+const isSkippedDoc = (label) =>
+  label && SKIP_DOC_PATTERNS.some((re) => re.test(String(label)));
 
 const SECTION_KEYS = [
   { key: 'document_prompts_corp', matches: ['private', 'public', 'limited', 'company', 'pvt', 'ltd', 'corp'] },
@@ -83,10 +89,18 @@ function extractDocumentsFromWebxpay(webxpayData) {
       const url = doc.url || (doc.path ? `${WEBXPAY_BASE}${doc.path}` : null);
       if (!url) return;
       // S3 presigned URLs carry their own auth — no extra headers needed
-      const docType = doc.label
+      // Prefer the human-readable title (e.g. "Form 01 / Form 40") over the raw API key
+      // (e.g. "form_one_or_forty") so the AI understands compound labels correctly.
+      const rawLabel = doc.label;
+      const docType = (rawLabel && DOC_NAME_TO_TITLE[rawLabel])
+        || (rawLabel ? rawLabel.replace(/_/g, ' ') : null)
         || (doc.document_name
           ? (DOC_NAME_TO_TITLE[doc.document_name] || doc.document_name.replace(/_/g, ' '))
           : 'Document');
+      if (isSkippedDoc(docType) || isSkippedDoc(rawLabel) || isSkippedDoc(doc.document_name)) {
+        console.log(`[documentAnalyzer] Skipping ignored document: "${docType}"`);
+        return;
+      }
       docs.push({ url, docType, label: docType, needsAuth: false, source });
     });
     return docs;
@@ -97,13 +111,12 @@ function extractDocumentsFromWebxpay(webxpayData) {
     data.documents.forEach((doc) => {
       const url = doc.url || (doc.path ? `${WEBXPAY_BASE}${doc.path}` : null);
       if (url && doc.upload_status !== 0) {
-        docs.push({
-          url,
-          docType: resolveDocType(doc.file_detail, doc.document_name, doc.path),
-          label: resolveDocType(doc.file_detail, doc.document_name, doc.path),
-          needsAuth: true,
-          source: 'documents',
-        });
+        const docType = resolveDocType(doc.file_detail, doc.document_name, doc.path);
+        if (isSkippedDoc(docType) || isSkippedDoc(doc.file_detail) || isSkippedDoc(doc.document_name)) {
+          console.log(`[documentAnalyzer] Skipping ignored document: "${docType}"`);
+          return;
+        }
+        docs.push({ url, docType, label: docType, needsAuth: true, source: 'documents' });
       }
     });
   }
@@ -151,7 +164,7 @@ function extractDocumentsFromWebxpay(webxpayData) {
 }
 
 async function downloadBuffer(url, authHeaders) {
-  const response = await fetch(url, { headers: authHeaders, redirect: 'follow' });
+  const response = await fetch(url, { headers: authHeaders, redirect: 'follow', timeout: 30000 });
   if (!response.ok) throw new Error(`HTTP ${response.status} for ${url.slice(0, 80)}`);
   return response.buffer();
 }
@@ -186,6 +199,14 @@ function buildAnalysisInstruction(promptText, merchantTypeName, loadedDocs) {
   }));
 
   return [
+    '=== CRITICAL — READ BEFORE EVERYTHING ELSE ===',
+    `TODAY'S DATE (reference date): ${referenceDate}`,
+    `You MUST use ${referenceDate} as the current date for ALL date comparisons in this analysis.`,
+    `DO NOT use your model training cutoff or any assumed date. The ONLY valid reference date is ${referenceDate}.`,
+    `Any document date whose year is less than ${referenceDate.slice(0, 4)} is UNCONDITIONALLY in the past — never flag it as future.`,
+    `A date is "future" ONLY if it is strictly after ${referenceDate} under every reasonable format interpretation.`,
+    '=== END CRITICAL CONTEXT ===',
+    '',
     promptText,
     '',
     '--- SYSTEM EXECUTION CONTEXT ---',
@@ -240,12 +261,10 @@ async function loadRemoteDocuments(webxpayData, authHeaders, _requirements = [])
   const filteredDocs = remoteDocs;
   console.log(`[documentAnalyzer] Google AI phase - ${filteredDocs.length}/${remoteDocs.length} non-outlet API document(s) queued`);
 
-  const loaded = [];
-  const failures = [];
-
-  for (const doc of filteredDocs) {
-    const label = buildDocLabel(doc);
-    try {
+  // Download all documents in parallel — much faster than sequential for 8–12 docs.
+  const results = await Promise.allSettled(
+    filteredDocs.map(async (doc) => {
+      const label = buildDocLabel(doc);
       const headers = doc.needsAuth ? authHeaders : {};
       const buffer = await downloadBuffer(doc.url, headers);
       const urlPath = doc.url.split('?')[0];
@@ -253,18 +272,22 @@ async function loadRemoteDocuments(webxpayData, authHeaders, _requirements = [])
       if (buffer.length > MAX_INLINE_FILE_BYTES) {
         throw new Error(`File is ${(buffer.length / 1024 / 1024).toFixed(1)} MB, above inline limit`);
       }
-      loaded.push({
-        label,
-        mimeType: mimeFromExt(ext),
-        sizeBytes: buffer.length,
-        data: buffer.toString('base64'),
-      });
       console.log(`[documentAnalyzer] Loaded "${label}" (${buffer.length} bytes)`);
-    } catch (err) {
-      console.error(`[documentAnalyzer] Failed "${label}": ${err.message}`);
-      failures.push({ label, error: err.message });
+      return { label, mimeType: mimeFromExt(ext), sizeBytes: buffer.length, data: buffer.toString('base64') };
+    })
+  );
+
+  const loaded = [];
+  const failures = [];
+  results.forEach((result, i) => {
+    const label = buildDocLabel(filteredDocs[i]);
+    if (result.status === 'fulfilled') {
+      loaded.push(result.value);
+    } else {
+      console.error(`[documentAnalyzer] Failed "${label}": ${result.reason?.message}`);
+      failures.push({ label, error: result.reason?.message || 'Unknown error' });
     }
-  }
+  });
 
   return { loaded, failures };
 }
@@ -309,14 +332,6 @@ async function callGoogleAi(prompt, loadedDocs, failedDocs) {
     throw new Error('Google AI API key not configured. Set GOOGLE_AI_API_KEY or GEMINI_API_KEY in backend/.env.');
   }
 
-  if (isOverBudget(AI_BUDGET_USD)) {
-    const remaining = getRemainingBudget(AI_BUDGET_USD);
-    throw new Error(
-      `AI analysis budget limit of $${AI_BUDGET_USD.toFixed(2)} has been reached. ` +
-      `Remaining: $${remaining.toFixed(5)}. Contact admin to reset the budget.`
-    );
-  }
-
   const parts = [{ text: prompt }];
 
   failedDocs.forEach((doc) => {
@@ -337,22 +352,43 @@ async function callGoogleAi(prompt, loadedDocs, failedDocs) {
     ? GOOGLE_AI_MODEL
     : `models/${GOOGLE_AI_MODEL}`;
 
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/${modelPath}:generateContent?key=${encodeURIComponent(apiKey)}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts }],
-        generation_config: {
-          temperature: 0.1,
-          response_mime_type: 'application/json',
-        },
-      }),
+  let response;
+  try {
+    response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/${modelPath}:generateContent?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts }],
+          generationConfig: {
+            temperature: 0.1,
+            responseMimeType: 'application/json',
+          },
+        }),
+        timeout: 180000,
+      }
+    );
+  } catch (fetchErr) {
+    if (fetchErr.type === 'request-timeout') {
+      const err = new Error('Google AI request timed out after 3 minutes. The model may be overloaded. Please try again.');
+      err.statusCode = 504;
+      throw err;
     }
-  );
+    if (fetchErr.type === 'request-timeout') {
+      throw new Error('Google AI request timed out after 3 minutes. The model may be overloaded — please try again.');
+    }
+    throw fetchErr;
+  }
 
-  const bodyText = await response.text();
+  let bodyText;
+  try {
+    bodyText = await response.text();
+  } catch (readErr) {
+    const err = new Error('Google AI request timed out or connection dropped while reading response. Please try again.');
+    err.statusCode = 504;
+    throw err;
+  }
   let body;
   try {
     body = JSON.parse(bodyText);
@@ -362,7 +398,10 @@ async function callGoogleAi(prompt, loadedDocs, failedDocs) {
 
   if (!response.ok) {
     const message = body?.error?.message || bodyText.slice(0, 500) || `HTTP ${response.status}`;
-    throw new Error(`Google AI request failed: ${message}`);
+    const err = new Error(`Google AI request failed: ${message}`);
+    err.statusCode = response.status === 429 ? 429 : 502;
+    err.data = body?.error || body || bodyText.slice(0, 500);
+    throw err;
   }
 
   const rawText = body?.candidates?.[0]?.content?.parts
@@ -371,12 +410,11 @@ async function callGoogleAi(prompt, loadedDocs, failedDocs) {
     .trim();
 
   const usage = body?.usageMetadata || {};
-  recordUsage(
+  const { callCost } = recordUsage(
     usage.promptTokenCount || usage.totalTokenCount || 0,
     usage.candidatesTokenCount || 0
   );
   console.log(`[documentAnalyzer] Google AI response: ${rawText?.length ?? 0} chars | model=${GOOGLE_AI_MODEL}`);
-
   return parseJsonFromModel(rawText);
 }
 
@@ -405,4 +443,122 @@ async function analyzeDocuments({ merchantTypeName, webxpayData, authHeaders, lo
   return result;
 }
 
-module.exports = { analyzeDocuments };
+async function generateVerificationInsight(report) {
+  const apiKey = getGoogleApiKey();
+  if (!apiKey) return null;
+
+  const lines = [];
+
+  (report.mismatches || []).forEach((row) => {
+    lines.push(`MISMATCH — Field: "${row.field}" | Document: "${row.document || '?'}" | AI read: "${row.documentValue ?? row.value}" | System has: "${row.systemValue}" | ${row.reason || ''}`);
+  });
+
+  (report.missingData || []).forEach((row) => {
+    lines.push(`MISSING — Field/Document: "${row.field}" | ${row.reason || 'not found in extraction'}`);
+  });
+
+  (report.invalidData || []).forEach((row) => {
+    lines.push(`INVALID — Field: "${row.field}" | ${row.reason || 'failed validation'}`);
+  });
+
+  if (lines.length === 0) return 'All verified fields matched. No issues requiring attention were found.';
+
+  const prompt = `You are a merchant onboarding compliance analyst. Below are the issues found during document verification for a ${report.merchantType || 'merchant'} account:
+
+${lines.join('\n')}
+
+Write a concise plain-English summary (4–7 sentences) that:
+- Explains each real issue clearly and what it means in practice
+- Identifies if any mismatch is likely just a formatting difference vs a genuine data conflict
+- Calls out if the same field conflicts across multiple documents or involves different people
+- States exactly what the onboarding officer must do to resolve each issue before approval
+
+Use **bold** to highlight field names, specific values, and critical action items. Be direct and specific. Use no jargon. Return only the summary text with **bold** markdown for emphasis — no JSON, no bullet points, no headings.`;
+
+  try {
+    const modelPath = GOOGLE_AI_MODEL.startsWith('models/') ? GOOGLE_AI_MODEL : `models/${GOOGLE_AI_MODEL}`;
+    const resp = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/${modelPath}:generateContent?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          generationConfig: { temperature: 0.3 },
+        }),
+        timeout: 30000,
+      }
+    );
+    const body = await resp.json();
+    const usage = body?.usageMetadata || {};
+    recordUsage(usage.promptTokenCount || 0, usage.candidatesTokenCount || 0);
+    const text = (body?.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('').trim();
+    return text || null;
+  } catch (err) {
+    console.warn('[generateVerificationInsight] skipped:', err.message);
+    return null;
+  }
+}
+
+// After building a report, call this with the cross-document mismatches to let the AI
+// decide which ones are semantically compatible (same meaning, different wording).
+// Returns a Set of field names that are compatible — callers use patchReportCompatibleMismatches.
+async function verifyCrossDocumentMismatches(mismatches) {
+  const toCheck = mismatches.filter(
+    (m) => m.documentValue && m.documentValue !== '—' && m.systemValue && m.systemValue !== '—'
+  );
+  if (!toCheck.length) return new Set();
+
+  const apiKey = getGoogleApiKey();
+  if (!apiKey) return new Set();
+
+  const items = toCheck
+    .map((m, i) => `${i + 1}. Field: "${m.field}" | Document A: "${m.documentValue}" | Document B: "${m.systemValue}"`)
+    .join('\n');
+
+  const prompt = `You are a merchant onboarding compliance analyst reviewing cross-document discrepancies.
+For each field below, two documents contain different values. Decide which are SEMANTICALLY COMPATIBLE
+(same meaning worded differently — e.g. "Book Shop, Communication" and "Stationery items" describe the
+same type of retail business) versus GENUINELY DIFFERENT (a real data conflict that must be resolved).
+
+${items}
+
+Return ONLY a JSON array of 1-based item numbers that are semantically compatible. Return [] if none.
+Be conservative: only mark items compatible when you are highly confident they mean the same thing.`;
+
+  try {
+    const modelPath = GOOGLE_AI_MODEL.startsWith('models/') ? GOOGLE_AI_MODEL : `models/${GOOGLE_AI_MODEL}`;
+    const resp = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/${modelPath}:generateContent?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
+        }),
+        timeout: 30000,
+      }
+    );
+    const body = await resp.json();
+    const usage = body?.usageMetadata || {};
+    recordUsage(usage.promptTokenCount || 0, usage.candidatesTokenCount || 0);
+    const raw = (body?.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('').trim();
+    const indices = JSON.parse(raw);
+    if (!Array.isArray(indices)) return new Set();
+    const compatible = new Set();
+    indices.forEach((idx) => {
+      const item = toCheck[idx - 1];
+      if (item) compatible.add(item.field);
+    });
+    if (compatible.size) {
+      console.log(`[semanticCheck] Compatible cross-doc mismatch(es): ${[...compatible].join(', ')}`);
+    }
+    return compatible;
+  } catch (err) {
+    console.warn('[verifyCrossDocumentMismatches] AI check skipped:', err.message);
+    return new Set();
+  }
+}
+
+module.exports = { analyzeDocuments, generateVerificationInsight, verifyCrossDocumentMismatches };

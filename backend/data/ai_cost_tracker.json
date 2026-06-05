@@ -1,7 +1,7 @@
 {
-  "total_cost_usd": 0.23686334999999994,
-  "total_input_tokens": 539753,
-  "total_output_tokens": 259834,
-  "call_count": 39,
-  "last_updated": "2026-05-27T04:10:00.693Z"
+  "total_cost_usd": 1.3194869999999999,
+  "total_input_tokens": 2422264,
+  "total_output_tokens": 1593579,
+  "call_count": 196,
+  "last_updated": "2026-06-04T05:30:25.217Z"
 }

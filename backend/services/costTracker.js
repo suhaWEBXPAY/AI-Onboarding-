@@ -5,7 +5,7 @@ const TRACKER_FILE = path.join(__dirname, '../data/ai_cost_tracker.json');
 
 const INPUT_PRICE = Number(process.env.AI_INPUT_PRICE_PER_MILLION || 0.15) / 1_000_000;
 const OUTPUT_PRICE = Number(process.env.AI_OUTPUT_PRICE_PER_MILLION || 0.60) / 1_000_000;
-const DEFAULT_BUDGET_USD = Number(process.env.AI_BUDGET_USD || 0.50);
+const DEFAULT_BUDGET_USD = Number(process.env.AI_BUDGET_USD || 5.00);
 
 function read() {
   try {

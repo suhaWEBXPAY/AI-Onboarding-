@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import PageLayout from '../components/PageLayout';
 import api from '../services/api';
 
@@ -18,10 +18,60 @@ const parseJson = (value, label) => {
   try { return JSON.parse(value); } catch { throw new Error(`${label} must be valid JSON.`); }
 };
 
+const formatJsonValue = (parsed) => {
+  if (Array.isArray(parsed)) {
+    return parsed.map((item) => {
+      if (item && typeof item === 'object') {
+        if (item.name) return item.name;
+        return Object.entries(item).filter(([, v]) => v).map(([k, v]) => `${k}: ${v}`).join(', ');
+      }
+      return String(item);
+    }).join(' · ');
+  }
+  if (parsed && typeof parsed === 'object') {
+    if (parsed.name) return parsed.name;
+    return Object.entries(parsed).filter(([, v]) => v).map(([k, v]) => `${k}: ${v}`).join(', ');
+  }
+  return String(parsed);
+};
+
 const formatCell = (value) => {
   if (value === undefined || value === null || value === '') return '-';
-  if (typeof value === 'object') return JSON.stringify(value);
+  if (typeof value === 'object') return formatJsonValue(value);
+  if (typeof value === 'string') {
+    const t = value.trim();
+    if ((t.startsWith('[') || t.startsWith('{')) && (t.endsWith(']') || t.endsWith('}'))) {
+      try { return formatJsonValue(JSON.parse(t)); } catch { /* fall through */ }
+    }
+  }
   return String(value);
+};
+
+const formatDocLabel = (doc) => {
+  if (!doc || doc === '—') return doc;
+  return String(doc)
+    .split(/\s+vs\s+/i)
+    .map((part) => part
+      .split(',')
+      .map((seg) => seg
+        .replace(/LABEL:\s*/gi, '')
+        .replace(/\s*\|\s*API_SOURCE:\s*\S+/gi, '')
+        .replace(/_/g, ' ')
+        .trim()
+      )
+      .filter(Boolean)
+      .join(', ')
+    )
+    .join(' vs ');
+};
+
+const parseBold = (text) => {
+  if (!text) return null;
+  return text.split(/(\*\*[^*]+\*\*)/g).map((part, i) =>
+    part.startsWith('**') && part.endsWith('**')
+      ? <strong key={i}>{part.slice(2, -2)}</strong>
+      : part
+  );
 };
 
 const fmtDate = (value) => value
@@ -199,13 +249,102 @@ const getRuleItems = (check, report) => {
   return [];
 };
 
-function RuleCheckItem({ check, report, allDocuments = [] }) {
+function RuleCheckRow({ row, checkName, ruleKey, override, mid, allDocuments, onViewDoc, onSave, onRemove }) {
+  const [showInput, setShowInput] = useState(false);
+  const [draft, setDraft] = useState('');
+  const [saving, setSaving] = useState(false);
+  const matchedDoc = findDocByLabel(row.document, allDocuments);
+
+  const handleSave = async () => {
+    if (!draft.trim() || saving) return;
+    setSaving(true);
+    await onSave({ rule_check_name: checkName, field_name: row.field || '', document_source: row.document || '—', comment: draft.trim() });
+    setSaving(false);
+    setShowInput(false);
+    setDraft('');
+  };
+
+  const handleKeyDown = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSave(); }
+    if (e.key === 'Escape') { setShowInput(false); setDraft(''); }
+  };
+
+  const isOverridden = !!override;
+
+  return (
+    <tr className={isOverridden ? 'rule-row-overridden' : ''}>
+      <td className="td-name">{formatCell(row.field)}</td>
+      <td className="td-meta">
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span>{formatDocLabel(row.document)}</span>
+          {matchedDoc && (
+            <button type="button" className="btn-doc-open" onClick={() => onViewDoc(matchedDoc)}
+              title={`Open ${matchedDoc.label || row.document}`}>View</button>
+          )}
+        </div>
+      </td>
+      <td className="td-value">{formatCell(row.aiValue)}</td>
+      <td className="td-value">{formatCell(row.apiValue)}</td>
+      <td><ExpandableComment text={formatCell(row.comment)} /></td>
+      <td className="rule-solution-cell" style={isOverridden ? { color: 'var(--ash)', fontStyle: 'italic' } : {}}>
+        {getSolution(row, ruleKey)}
+      </td>
+      {mid && (
+        <td className="rule-action-cell">
+          {isOverridden ? (
+            <div className="rule-override-confirmed">
+              <span className="rule-override-badge">✓ Ignored</span>
+              {override.comment && <span className="rule-override-note">{override.comment}</span>}
+              <button type="button" className="rule-override-remove-btn" onClick={() => onRemove(override.id)}>Undo</button>
+            </div>
+          ) : showInput ? (
+            <div className="rule-override-input-wrap">
+              <input
+                className="rule-override-comment-input"
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder="Reason for ignoring… (Enter to save)"
+                autoFocus
+              />
+              <div className="rule-override-input-actions">
+                <button type="button" className="rule-override-confirm-btn" onClick={handleSave} disabled={!draft.trim() || saving}>
+                  {saving ? '…' : 'Save'}
+                </button>
+                <button type="button" className="rule-override-cancel-btn" onClick={() => { setShowInput(false); setDraft(''); }}>
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : (
+            <button type="button" className="rule-override-btn" onClick={() => setShowInput(true)}>
+              Ignore
+            </button>
+          )}
+        </td>
+      )}
+    </tr>
+  );
+}
+
+function RuleCheckItem({ check, report, allDocuments = [], mid, overrides = [], onSaveOverride, onDeleteOverride }) {
   const [expanded, setExpanded] = useState(false);
   const [viewerDoc, setViewerDoc] = useState(null);
   const items = getRuleItems(check, report);
   const hasItems = items.length > 0;
+  const ruleKey = RULE_STATUS_MAP[check.name];
+
+  const findOverride = (item) => overrides.find((ov) =>
+    ov.rule_check_name === check.name &&
+    ov.field_name === (item.field || '') &&
+    ov.document_source === (item.document || '—')
+  ) || null;
+
+  const allOverridden = hasItems && !check.isVerdict && items.every((item) => !!findOverride(item));
+  const effectiveStatus = allOverridden ? 'pass' : check.status;
+
   return (
-    <div className={`verification-rule-row rule-row--expandable${expanded ? ' rule-row--open' : ''}`}>
+    <div className={`verification-rule-row rule-row--expandable${expanded ? ' rule-row--open' : ''}${check.isVerdict ? ' rule-row--verdict' : ''}`}>
       <button
         type="button"
         className="rule-row-header"
@@ -213,9 +352,13 @@ function RuleCheckItem({ check, report, allDocuments = [] }) {
         style={{ cursor: hasItems ? 'pointer' : 'default' }}
         aria-expanded={expanded}
       >
-        <span className={`verification-rule-state verification-rule-state--${check.status}`}>{check.status}</span>
+        <span className={`verification-rule-state verification-rule-state--${effectiveStatus}${check.isVerdict ? ' verification-rule-state--verdict' : ''}`}>
+          {effectiveStatus === 'pass'
+            ? (check.isVerdict ? 'ELIGIBLE' : allOverridden ? 'overridden' : 'pass')
+            : (check.isVerdict ? 'BLOCKED' : check.status)}
+        </span>
         <div className="rule-header-text">
-          <div className="verification-rule-name">{check.name}</div>
+          <div className={`verification-rule-name${check.isVerdict ? ' verification-rule-name--verdict' : ''}`}>{check.name}</div>
           <div className="verification-rule-detail">{check.detail}</div>
         </div>
         {hasItems && <span className="rule-expand-chevron">{expanded ? '▲' : '▼'}</span>}
@@ -232,30 +375,24 @@ function RuleCheckItem({ check, report, allDocuments = [] }) {
                   <th>System Value</th>
                   <th>Detail / Reason</th>
                   <th className="rule-solution-col">Solution</th>
+                  {mid && <th className="rule-action-col">Action</th>}
                 </tr>
               </thead>
               <tbody>
-                {items.map((row, i) => {
-                  const matchedDoc = findDocByLabel(row.document, allDocuments);
-                  return (
-                    <tr key={`${row.field}-${i}`}>
-                      <td className="td-name">{formatCell(row.field)}</td>
-                      <td className="td-meta">
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                          <span>{formatCell(row.document)}</span>
-                          {matchedDoc && (
-                            <button type="button" className="btn-doc-open" onClick={() => setViewerDoc(matchedDoc)}
-                              title={`Open ${matchedDoc.label || row.document}`}>View</button>
-                          )}
-                        </div>
-                      </td>
-                      <td className="td-value">{formatCell(row.aiValue)}</td>
-                      <td className="td-value">{formatCell(row.apiValue)}</td>
-                      <td><ExpandableComment text={formatCell(row.comment)} /></td>
-                      <td className="rule-solution-cell">{getSolution(row, RULE_STATUS_MAP[check.name])}</td>
-                    </tr>
-                  );
-                })}
+                {items.map((row, i) => (
+                  <RuleCheckRow
+                    key={`${row.field}-${i}`}
+                    row={row}
+                    checkName={check.name}
+                    ruleKey={ruleKey}
+                    override={findOverride(row)}
+                    mid={mid}
+                    allDocuments={allDocuments}
+                    onViewDoc={(doc) => setViewerDoc(doc)}
+                    onSave={onSaveOverride}
+                    onRemove={onDeleteOverride}
+                  />
+                ))}
               </tbody>
             </table>
           </div>
@@ -363,7 +500,7 @@ function UnifiedTable({ rows = [], allDocuments = [] }) {
                   <td className="td-name">{formatCell(row.field)}</td>
                   <td className="td-meta">
                     <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                      <span>{formatCell(row.document)}</span>
+                      <span>{formatDocLabel(row.document)}</span>
                       {matchedDoc && (
                         <button type="button" className="btn-doc-open" onClick={() => setViewerDoc(matchedDoc)}
                           title={`Open ${matchedDoc.label || row.document}`}>View</button>
@@ -392,7 +529,7 @@ function UnifiedTable({ rows = [], allDocuments = [] }) {
   );
 }
 
-function RuleChecks({ checks = [], report, allDocuments = [] }) {
+function RuleChecks({ checks = [], report, allDocuments = [], mid, overrides = [], onSaveOverride, onDeleteOverride }) {
   if (!checks.length) return null;
   return (
     <div className="card">
@@ -402,7 +539,16 @@ function RuleChecks({ checks = [], report, allDocuments = [] }) {
       </div>
       <div className="verification-rule-list">
         {checks.map((check) => (
-          <RuleCheckItem key={check.name} check={check} report={report} allDocuments={allDocuments} />
+          <RuleCheckItem
+            key={check.name}
+            check={check}
+            report={report}
+            allDocuments={allDocuments}
+            mid={mid}
+            overrides={overrides}
+            onSaveOverride={onSaveOverride}
+            onDeleteOverride={onDeleteOverride}
+          />
         ))}
       </div>
     </div>
@@ -422,6 +568,38 @@ export default function OnboardVerification() {
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState({ text: '', type: '' });
+  const [overrides, setOverrides] = useState([]);
+
+  const loadOverrides = useCallback(async (mid) => {
+    if (!mid) { setOverrides([]); return; }
+    try {
+      const res = await api.get(`/onboard-verification/rule-overrides/${encodeURIComponent(mid)}`);
+      setOverrides(res.data || []);
+    } catch {
+      setOverrides([]);
+    }
+  }, []);
+
+  const handleSaveOverride = useCallback(async (overrideData) => {
+    const mid = form.mid.trim();
+    if (!mid) return;
+    try {
+      const res = await api.post('/onboard-verification/rule-overrides', { mid, ...overrideData });
+      setOverrides(res.data || []);
+    } catch {
+      setMessage({ text: 'Failed to save override.', type: 'error' });
+    }
+  }, [form.mid]);
+
+  const handleDeleteOverride = useCallback(async (id) => {
+    const mid = form.mid.trim();
+    try {
+      const res = await api.delete(`/onboard-verification/rule-overrides/${id}?mid=${encodeURIComponent(mid)}`);
+      setOverrides(res.data || []);
+    } catch {
+      setMessage({ text: 'Failed to remove override.', type: 'error' });
+    }
+  }, [form.mid]);
 
   useEffect(() => {
     api.get('/merchant-types')
@@ -474,6 +652,7 @@ export default function OnboardVerification() {
     setResult(null);
     setMessage({ text: '', type: '' });
     setAutoFilled(false);
+    setOverrides([]);
   };
 
   const fetchAllForMid = async (mid) => {
@@ -523,6 +702,7 @@ export default function OnboardVerification() {
     if (docResult.status === 'fulfilled' && sysResult.status === 'fulfilled') {
       setMessage({ text: `Data loaded for MID ${mid}.`, type: 'success' });
     }
+    loadOverrides(mid);
   };
 
   const handleMidKeyDown = (event) => {
@@ -531,15 +711,21 @@ export default function OnboardVerification() {
 
   const handleMidBlur = () => { if (form.mid.trim()) fetchAllForMid(form.mid.trim()); };
 
-  const runAnalysis = async () => {
+  const runAnalysis = async (forceReExtract = false) => {
     const mid = form.mid.trim();
     if (!mid) { setMessage({ text: 'Enter a MID before running analysis.', type: 'error' }); return; }
     setAnalysing(true);
-    setMessage({ text: 'Running AI document analysis — this may take 30–60 seconds...', type: '' });
+    setMessage({
+      text: forceReExtract
+        ? 'Re-extracting documents with AI — this may take 30–60 seconds...'
+        : 'Running AI document analysis — this may take 30–60 seconds...',
+      type: '',
+    });
     try {
       const response = await api.post(`/onboard-verification/verify-mid/${encodeURIComponent(mid)}`, {
         merchant_type_id: form.merchant_type_id || undefined,
         merchant_channel: form.merchant_channel,
+        forceReExtract: forceReExtract || undefined,
       });
       setDocumentJson(asPrettyJson(response.data.documentData));
       setSystemJson(asPrettyJson(response.data.systemData));
@@ -554,8 +740,11 @@ export default function OnboardVerification() {
       setForm((prev) => ({ ...prev, merchant_channel: channel, ...(matchedType ? { merchant_type_id: String(matchedType.id) } : {}) }));
       setAutoFilled(true);
       setMessage({ text: 'Google AI document analysis and API verification complete.', type: 'success' });
+      loadOverrides(mid);
     } catch (err) {
-      setMessage({ text: err.response?.data?.message || 'Google AI verification failed.', type: 'error' });
+      const serverMsg = err.response?.data?.message;
+      const httpStatus = err.response?.status ? ` (HTTP ${err.response.status})` : '';
+      setMessage({ text: serverMsg || `Google AI verification failed${httpStatus}. Check server logs for details.`, type: 'error' });
     } finally {
       setAnalysing(false);
     }
@@ -563,11 +752,36 @@ export default function OnboardVerification() {
 
   const summary = result?.summary || {};
 
+  // Adjusted counts: overridden failure rows are moved from their failure bucket into matched.
+  const adjustedSummary = useMemo(() => {
+    const rows = result?.unifiedRows || [];
+    const failureStatuses = new Set(['missing', 'mismatch', 'invalid']);
+    let matched = summary.matchedFields || 0;
+    let missing = summary.missingData || 0;
+    let invalid = summary.invalidData || 0;
+    let mismatches = summary.mismatches || 0;
+
+    rows.forEach((row) => {
+      if (!failureStatuses.has(row.status)) return;
+      const isOverridden = overrides.some((ov) =>
+        ov.field_name === (row.field || '') &&
+        ov.document_source === (row.document || '—')
+      );
+      if (!isOverridden) return;
+      if (row.status === 'missing')  missing   = Math.max(0, missing   - 1);
+      if (row.status === 'mismatch') mismatches = Math.max(0, mismatches - 1);
+      if (row.status === 'invalid')  invalid   = Math.max(0, invalid   - 1);
+      matched += 1;
+    });
+
+    return { matched, missing, invalid, mismatches };
+  }, [summary, result, overrides]);
+
   const satisfactionScore = useMemo(() => {
-    const matched = summary.matchedFields || 0;
-    const total = matched + (summary.missingData || 0) + (summary.invalidData || 0) + (summary.mismatches || 0);
+    const { matched, missing, invalid, mismatches } = adjustedSummary;
+    const total = matched + missing + invalid + mismatches;
     return total === 0 ? null : Math.round((matched / total) * 100);
-  }, [summary]);
+  }, [adjustedSummary]);
 
   const allDocuments = useMemo(() => {
     if (!systemJson) return [];
@@ -744,7 +958,7 @@ export default function OnboardVerification() {
                   <button
                     className="btn btn-dark vi-action-btn"
                     type="button"
-                    onClick={runAnalysis}
+                    onClick={() => runAnalysis(false)}
                     disabled={busy}
                   >
                     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -753,6 +967,21 @@ export default function OnboardVerification() {
                     </svg>
                     {analysing ? 'Verifying…' : 'Analyze Documents & Verify'}
                   </button>
+                  {result && (
+                    <button
+                      className="btn btn-ghost vi-action-btn"
+                      type="button"
+                      onClick={() => runAnalysis(true)}
+                      disabled={busy}
+                      title="Force fresh AI extraction, ignoring cached results"
+                    >
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                        <polyline points="23 4 23 10 17 10"/>
+                        <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+                      </svg>
+                      Re-extract
+                    </button>
+                  )}
                   <button className="btn btn-primary vi-action-btn" type="submit" disabled={busy}>
                     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
                       <polygon points="5 3 19 12 5 21 5 3"/>
@@ -799,16 +1028,32 @@ export default function OnboardVerification() {
                       tone={satisfactionScore >= 80 ? 'success' : satisfactionScore >= 50 ? 'warning' : 'danger'} />
                   )}
                   <SummaryMetric label="Documents read" value={summary.receivedDocuments || 0} />
-                  <SummaryMetric label="Matched" value={summary.matchedFields || 0} tone="success" />
-                  <SummaryMetric label="Mismatches" value={summary.mismatches || 0} tone="danger" />
-                  <SummaryMetric label="Missing" value={summary.missingData || 0} tone="warning" />
-                  <SummaryMetric label="Invalid" value={summary.invalidData || 0} tone="danger" />
+                  <SummaryMetric label="Matched" value={adjustedSummary.matched} tone="success" />
+                  <SummaryMetric label="Mismatches" value={adjustedSummary.mismatches} tone="danger" />
+                  <SummaryMetric label="Missing" value={adjustedSummary.missing} tone="warning" />
+                  <SummaryMetric label="Invalid" value={adjustedSummary.invalid} tone="danger" />
                   <SummaryMetric label="AI-Only" value={summary.documentOnlyData || 0} tone="warning" />
                   <SummaryMetric label="System-Only" value={summary.systemOnlyData || 0} tone="warning" />
                 </div>
               </div>
-              <RuleChecks checks={result.ruleChecks} report={result} allDocuments={allDocuments} />
-              <UnifiedTable rows={result.unifiedRows || []} allDocuments={allDocuments} />
+              <RuleChecks
+                checks={result.ruleChecks}
+                report={result}
+                allDocuments={allDocuments}
+                mid={form.mid.trim() || null}
+                overrides={overrides}
+                onSaveOverride={handleSaveOverride}
+                onDeleteOverride={handleDeleteOverride}
+              />
+              <UnifiedTable
+                rows={(result.unifiedRows || []).filter((row) => {
+                  if (!['missing', 'mismatch', 'invalid'].includes(row.status)) return true;
+                  return !overrides.some(
+                    (ov) => ov.field_name === (row.field || '') && ov.document_source === (row.document || '—')
+                  );
+                })}
+                allDocuments={allDocuments}
+              />
             </>
           )}
     </PageLayout>

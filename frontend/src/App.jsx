@@ -3,6 +3,7 @@ import Login from './pages/Login';
 import RequirementConfig from './pages/RequirementConfig';
 import OnboardVerification from './pages/OnboardVerification';
 import MerchantAnalysis from './pages/MerchantAnalysis';
+import Documents from './pages/Documents';
 import ProtectedRoute from './components/ProtectedRoute';
 
 function App() {
@@ -33,6 +34,14 @@ function App() {
           element={
             <ProtectedRoute>
               <RequirementConfig />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/documents"
+          element={
+            <ProtectedRoute>
+              <Documents />
             </ProtectedRoute>
           }
         />

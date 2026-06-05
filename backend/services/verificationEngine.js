@@ -9,6 +9,7 @@ const AI_METADATA_SECTION_KEYS = new Set([
   'warnings',
   'onboardingeligibility',
   'satisfactionascore',
+  'satisfactionasocre', // AI typo variant — "Socre" instead of "Score"
   'satisfactionscore',
   'promptfieldcoverage',
   'documentpresence',
@@ -28,6 +29,10 @@ const AI_METADATA_SECTION_KEYS = new Set([
   'websiteinsights',
   'websiteinfo',
   'websitedata',
+  // shareholder data is AI-internal — no WebXPay system counterpart
+  'shareholdersinformation',
+  // amendment notes are narrative text, not field data
+  'amendments',
 ]);
 
 // Canonical field names from the WebXPay system data that are internal/operational
@@ -245,6 +250,12 @@ const FIELD_ALIAS_GROUPS = [
   [
     'nic_number',
     'nic number',
+    'nic_passport_dl_number',
+    'nic/passport/dl number',
+    'nic passport dl number',
+    'nic_passport_driving_license_number',
+    'nic/passport/driving license number',
+    'nic passport driving license number',
     'owner_nic',
     'owner nic',
     'id_number',
@@ -358,6 +369,13 @@ const normalizeDocName = (value = '') => String(value)
   .replace(/\bdriving\s+licence\b/g, 'identity document')
   .replace(/\baoa\b/g, 'articles of association')
   .replace(/\bboa\b/g, 'board resolution')
+  // Form number aliases — handle underscore and word forms before stripping
+  .replace(/form[_\s]one(?:[_\s]or[_\s]forty)?/g, 'form 1')
+  .replace(/\bform[_\s]0*1\b/g, 'form 1')
+  .replace(/\bform[_\s]0*20\b/g, 'form 20')
+  .replace(/\bform[_\s]twenty\b/g, 'form 20')
+  .replace(/\bform[_\s]0*13\b/g, 'form 13')
+  .replace(/\bform[_\s]thirteen\b/g, 'form 13')
   .replace(/[^a-z0-9]+/g, ' ')
   .trim();
 
@@ -393,6 +411,63 @@ const displayValue = (value) => {
   }
   return JSON.stringify(value);
 };
+
+const normalizeIdentityToken = (value = '') => {
+  const cleaned = String(value || '').replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+  return cleaned.length === 13 && /^\d{12}[vx]$/.test(cleaned)
+    ? cleaned.slice(0, 12)
+    : cleaned;
+};
+
+const extractIdentityTokens = (value = '') => {
+  const text = String(value || '').toUpperCase();
+  const matches = text.match(/\b(?:[A-Z]{1,3}\d{6,9}|\d{9}[VX]|\d{12}[VX]?)\b/g) || [];
+  return [...new Set(matches.map(normalizeIdentityToken).filter(Boolean))];
+};
+
+const isValidNicToken = (value) => /^(\d{9}[vx]|\d{12})$/.test(normalizeIdentityToken(value));
+const isValidPassportToken = (value) => /^[a-z]{1,3}\d{6,9}$/.test(normalizeIdentityToken(value));
+const isValidIdentityToken = (value) => isValidNicToken(value) || isValidPassportToken(value);
+
+const identityTokenType = (value) => {
+  if (isValidNicToken(value)) return 'nic';
+  if (isValidPassportToken(value)) return 'passport';
+  return null;
+};
+
+const identityTypesIn = (value = '') => new Set(
+  extractIdentityTokens(value).map(identityTokenType).filter(Boolean)
+);
+
+const hasCrossTypeIdentityPair = (left = '', right = '') => {
+  const leftTokens = extractIdentityTokens(left);
+  const rightTokens = extractIdentityTokens(right);
+  if (!leftTokens.length || !rightTokens.length) return false;
+  if (leftTokens.some((token) => rightTokens.includes(token))) return false;
+
+  const leftTypes = new Set(leftTokens.map(identityTokenType).filter(Boolean));
+  const rightTypes = new Set(rightTokens.map(identityTokenType).filter(Boolean));
+  if (!leftTypes.size || !rightTypes.size) return false;
+
+  return ![...leftTypes].some((type) => rightTypes.has(type));
+};
+
+const hasMixedIdentityTypesInText = (value = '') => {
+  const types = identityTypesIn(value);
+  return types.has('nic') && types.has('passport');
+};
+
+const isIdentityComparisonContext = (key = '') => (
+  key.includes('nic')
+  || key.includes('passport')
+  || key.includes('nationalidentity')
+  || key.includes('drivinglicense')
+  || key.includes('drivinglicence')
+  || key.includes('idnumber')
+  || key.includes('stakeholderid')
+  || key === 'id'
+  || key === 'idid'
+);
 
 const flattenObject = (input, prefix = '', rows = []) => {
   if (Array.isArray(input)) {
@@ -850,8 +925,66 @@ const valuesEqual = (left, right, context = '') => {
   if (isBlank(left) || isBlank(right)) return false;
   if (normalizeComparable(left) === normalizeComparable(right)) return true;
 
+  // Alphanumeric codes (registration numbers, NICs, account numbers) — spacing is not meaningful
+  const leftNoSpace = normalizeComparable(left).replace(/\s/g, '');
+  const rightNoSpace = normalizeComparable(right).replace(/\s/g, '');
+  if (
+    leftNoSpace === rightNoSpace
+    && /^[a-z0-9]+$/.test(leftNoSpace)
+    && /\d/.test(leftNoSpace)
+  ) return true;
+
   const key = normalizeKey(context);
-  if (key.includes('address')) return addressesEqual(left, right);
+
+  if (isIdentityComparisonContext(key)) {
+    const leftIds = extractIdentityTokens(left);
+    const rightIds = extractIdentityTokens(right);
+    if (leftIds.length && rightIds.length && leftIds.some((id) => rightIds.includes(id))) {
+      return true;
+    }
+  }
+
+  // NIC: new-format 12-digit NICs sometimes have a trailing V/X added by OCR.
+  // "198604601285V" and "198604601285" refer to the same person.
+  if (key.includes('nic') || key.includes('nationalidentity') || key.includes('nicpassport')) {
+    const stripNicSuffix = (s) => (s.length === 13 && /^\d{12}[vx]$/.test(s)) ? s.slice(0, 12) : s;
+    if (stripNicSuffix(leftNoSpace) === stripNicSuffix(rightNoSpace)) return true;
+  }
+
+  // Registration numbers may carry a province prefix in one source but not the other.
+  // e.g. "U 10537" (BRC) vs "WU10537" (system) — numeric core "10537" is the same.
+  if (key.includes('registrationnumber') || key.includes('brcnumber')) {
+    const leftCore = leftNoSpace.replace(/^[a-z]+/, '');
+    const rightCore = rightNoSpace.replace(/^[a-z]+/, '');
+    if (leftCore && rightCore && leftCore === rightCore
+        && /^\d+$/.test(leftCore) && leftCore.length >= 3) return true;
+  }
+  if (key.includes('address')) {
+    // Fuzzy address matching applies only to business/registered addresses.
+    // Stakeholder personal addresses (owner, residential, present) use standard comparison only.
+    const isBusinessAddr = key.includes('business') || key.includes('legal')
+      || key.includes('registered') || key.includes('customer') || key.includes('street');
+    const isPersonalAddr = key.includes('owner') || key.includes('residential')
+      || key.includes('present') || key.includes('stakeholder');
+    if (isBusinessAddr && !isPersonalAddr) return addressesEqual(left, right);
+  }
+
+  // First/last name — system stores full name; derive the relevant part for comparison.
+  // e.g. firstName "Mohamed" vs fullName "Mohamed Hashim" → extract first token.
+  const isFirstNameCtx = key.includes('firstname') || key.includes('givenname');
+  const isLastNameCtx = key.includes('lastname') || key.includes('surname') || key.includes('familyname');
+  if (isFirstNameCtx || isLastNameCtx) {
+    const leftTokens = normalizeComparable(left).split(/\s+/).filter(Boolean);
+    const rightTokens = normalizeComparable(right).split(/\s+/).filter(Boolean);
+    if (rightTokens.length >= 2 && leftTokens.length === 1) {
+      const part = isFirstNameCtx ? rightTokens[0] : rightTokens[rightTokens.length - 1];
+      if (leftTokens[0] === part) return true;
+    }
+    if (leftTokens.length >= 2 && rightTokens.length === 1) {
+      const part = isFirstNameCtx ? leftTokens[0] : leftTokens[leftTokens.length - 1];
+      if (rightTokens[0] === part) return true;
+    }
+  }
 
   return false;
 };
@@ -861,7 +994,288 @@ const valuesNearMatch = (left, right) => {
   const leftNorm = normalizeComparable(left);
   const rightNorm = normalizeComparable(right);
   if (leftNorm.includes(rightNorm) || rightNorm.includes(leftNorm)) return true;
-  return tokenSimilarity(left, right) >= 0.70;
+  if (tokenSimilarity(left, right) >= 0.70) return true;
+
+  // Subset match: one side is a summary/elaboration of the other.
+  // e.g. "Foods, Beverages and Groceries" vs "Food & Beverage Trading, Manufacturing, Retail Groceries"
+  const STOP = new Set(['and', 'or', 'of', 'the', 'a', 'an', 'in', 'at', 'for', 'to', 'with', 'by']);
+  const leftTokens = leftNorm.split(/\s+/).filter((t) => t.length > 2 && !STOP.has(t));
+  const rightTokens = rightNorm.split(/\s+/).filter((t) => t.length > 2 && !STOP.has(t));
+  if (leftTokens.length >= 2 && rightTokens.length >= 2) {
+    const shorter = leftTokens.length <= rightTokens.length ? leftTokens : rightTokens;
+    const longer  = leftTokens.length <= rightTokens.length ? rightTokens : leftTokens;
+    const subsetMatches = shorter.filter((token) =>
+      longer.some((longToken) =>
+        token === longToken
+        || (token.length >= 4 && longToken.length >= 4
+            && (token.includes(longToken) || longToken.includes(token) || levenshteinDistance(token, longToken) <= 1))
+      )
+    ).length;
+    if (subsetMatches / shorter.length >= 0.6) return true;
+  }
+
+  return false;
+};
+
+const stripAiDocumentLabel = (name) => String(name || '')
+  .replace(/^LABEL:\s*/i, '')
+  .replace(/\s*\|\s*API_SOURCE:\s*.*/i, '')
+  .replace(/_/g, ' ')
+  .trim();
+
+const systemOperationalBusinessText = (systemData = {}) => [
+  systemData?.business_information?.nature_of_business,
+  systemData?.business_information?.category_code_id,
+  systemData?.business_information?.type_of_business,
+  systemData?.business_information?.registered_name_of_business,
+].filter(Boolean).join(' ');
+
+const searchableText = (value) => {
+  if (Array.isArray(value)) return value.map(searchableText).join(' ');
+  if (isPlainObject(value)) return Object.values(value).map(searchableText).join(' ');
+  return String(value || '');
+};
+
+const documentOperationalBusinessText = (documentData = {}) => {
+  const sourcedChunks = [];
+  promptCoverageItems(documentData).forEach((item) => {
+    const fieldNorm = normalizeKey(aiField(item, ''));
+    if (![
+      'natureofbusiness',
+      'productcategories',
+      'businessactivity',
+      'businessnature',
+      'categorycode',
+    ].includes(fieldNorm)) return;
+
+    const docNorm = normalizeDocName(stripAiDocumentLabel(aiDocument(item, '')));
+    if (
+      docNorm.includes('board resolution')
+      || docNorm.includes('articles of association')
+      || docNorm.includes('business registration certificate')
+      || docNorm.includes('website')
+      || docNorm.includes('system')
+    ) {
+      sourcedChunks.push(searchableText(aiExtractedValue(item)));
+    }
+  });
+
+  const fallbackChunks = [
+    documentData?.BusinessRegistration?.['Nature of Business'],
+    documentData?.BusinessRegistration?.NatureOfBusiness,
+    documentData?.BusinessRegistration?.['Category Code'],
+    documentData?.ArticlesOfAssociationDetails?.['Nature of Business'],
+    documentData?.ArticlesOfAssociationDetails?.NatureOfBusiness,
+    documentData?.WebsiteInsights?.['Product Categories'],
+  ].map(searchableText).filter(Boolean);
+
+  return (sourcedChunks.length ? sourcedChunks : fallbackChunks).join(' ');
+};
+
+const inferRequiredLicensesFromText = (value = '') => {
+  const text = normalizeComparable(value);
+  const licenses = [];
+  const add = (license) => {
+    if (!licenses.includes(license)) licenses.push(license);
+  };
+
+  if (/\b(ayurved\w*|homeopath\w*)\b/.test(text)) add('Ayurveda / Homeopathy Council Registration');
+  if (/\b(clinic|hospital|medical centre|medical center|diagnostic|laborator\w*|healthcare)\b/.test(text)) add('PHSRC License');
+  if (/\b(pharmacy|pharma\w*|pharmaceutical\w*|drug|medicine|medical equipment|medical device|cosmetic\w*|nmra)\b/.test(text)) add('NMRA License');
+  if (/\b(gem|jewel\w*)\b/.test(text)) add('National Gem & Jewelry Authority License');
+  if (/\b(hotel|lodging|travel agent|tour operator|tourism|slt?da)\b/.test(text)) add('SLTDA License');
+  if (/\b(telecom|telecommunication|trcsl)\b/.test(text)) add('TRCSL License');
+  if (/\b(airline|air ticket|ticketing agent|civil aviation)\b/.test(text)) add('Civil Aviation License');
+  if (/\b(insurance|ibsl)\b/.test(text)) add('IBSL Certificate');
+  if (/\b(wine|liquor|bar|alcohol|excise)\b/.test(text)) add('Excise or Divisional Secretariat License');
+  if (/\b(fuel station|fuel distribution|petroleum)\b/.test(text)) add('Fuel Distribution Agreement');
+  if (/\b(doctor|dentist|dental|slmc)\b/.test(text)) add('SLMC Registration');
+  if (/\b(veterinary|veterinarian|vet\b)\b/.test(text)) add('Veterinary Council Registration');
+  if (/\b(lawyer|legal service|attorney|bar association)\b/.test(text)) add('Bar Association Registration');
+
+  return licenses;
+};
+
+const operationalBusinessText = (documentData = {}, systemData = {}) => [
+  documentOperationalBusinessText(documentData),
+  systemOperationalBusinessText(systemData),
+].filter(Boolean).join(' ');
+
+const requiredOperationalLicenses = (documentData = {}, systemData = {}) => (
+  inferRequiredLicensesFromText(operationalBusinessText(documentData, systemData))
+);
+
+const hasRegulatedOperationalNature = (systemData = {}, documentData = {}) => {
+  const text = operationalBusinessText(documentData, systemData);
+  return requiredOperationalLicenses(documentData, systemData).length > 0
+    || /\b(phsrc|nmra|regulated license|regulated licence)\b/.test(normalizeComparable(text));
+};
+
+const isRegulatoryLicenseRequirement = (documentName, reason = '') => {
+  const text = normalizeComparable(`${documentName || ''} ${reason || ''}`);
+  return /\b(regulatory license|regulatory licence|license|licence|phsrc|nmra|ayurved\w*|homeopath\w*|medical|pharma\w*|cosmetic\w*|council)\b/.test(text)
+    && /\b(license|licence|registration|approval|certificate)\b/.test(text);
+};
+
+const isForm20Requirement = (documentName) => normalizeKey(documentName).includes('form20');
+
+const isDirectorIdentityForm20Reason = (reason = '') => {
+  const text = normalizeComparable(reason);
+  const hasDirectorIdentityReference = /\bdirector(s)?\s+(name|names|detail|details|nic|passport|identity|id|number|numbers)\b/.test(text)
+    || /\b(nic|passport|identity|id|number|numbers)\b.*\bdirector(s)?\b/.test(text);
+  return hasDirectorIdentityReference
+    && /\b(mismatch|inconsistent|inconsistency|not match|different)\b/.test(text)
+    && !hasMixedIdentityTypesInText(reason);
+};
+
+const shouldKeepAiRequiredDocument = ({ documentName, reason, requirements, systemData, documentData }) => {
+  if (isAoAAttestationDateIssue({ document: documentName, field: documentName, reason })) return false;
+  const docNameNorm = normalizeKey(normalizeDocName(documentName));
+  const reasonNorm = normalizeComparable(reason || '');
+  if (
+    docNameNorm.includes('articlesofassociation')
+    && normalizeComparable(documentName).includes('certified true copy')
+    && (!reasonNorm || /\b(attestation|date|dated|older|expired|stale|month|months|within)\b/.test(reasonNorm))
+  ) return false;
+
+  const matchedReq = requirements.find((req) => namesMatch(req.required_docs, documentName));
+  if (matchedReq?.is_mandatory) return true;
+
+  if (isForm20Requirement(documentName)) {
+    return isDirectorIdentityForm20Reason(reason);
+  }
+
+  if (isRegulatoryLicenseRequirement(documentName, reason)) {
+    return hasRegulatedOperationalNature(systemData, documentData);
+  }
+
+  return true;
+};
+
+const mergeDynamicLicenseRequirements = (requirements = [], documentData = {}, systemData = {}) => {
+  const detectedLicenseNames = requiredOperationalLicenses(documentData, systemData);
+
+  // Also surface licenses the AI explicitly named in its DocumentRequirements output
+  const aiRequiredDocs = documentData?.DocumentRequirements?.required_documents;
+  const aiLicenseNames = [];
+  if (Array.isArray(aiRequiredDocs)) {
+    aiRequiredDocs.forEach((doc) => {
+      const docName = typeof doc === 'string' ? doc : (doc?.document_name || doc?.required_docs || '');
+      if (
+        docName
+        && isRegulatoryLicenseRequirement(docName)
+        && !detectedLicenseNames.some((n) => namesMatch(n, docName))
+        && !aiLicenseNames.some((n) => namesMatch(n, docName))
+      ) {
+        aiLicenseNames.push(docName);
+      }
+    });
+  }
+
+  const licenseNames = [...detectedLicenseNames, ...aiLicenseNames];
+  if (!licenseNames.length) return requirements;
+
+  const merged = requirements.map((req) => {
+    if (!isRegulatoryLicenseRequirement(req.required_docs, req.description || '')) return req;
+    return {
+      ...req,
+      is_mandatory: true,
+      description: [
+        `Mandatory because operating activity requires: ${licenseNames.join(', ')}.`,
+        req.description || '',
+      ].filter(Boolean).join(' '),
+    };
+  });
+
+  licenseNames.forEach((licenseName) => {
+    if (merged.some((req) => namesMatch(req.required_docs, licenseName))) return;
+    merged.push({
+      id: `dynamic-${normalizeKey(licenseName)}`,
+      required_docs: licenseName,
+      description: 'Mandatory because the operating activity requires this regulatory license.',
+      is_mandatory: true,
+    });
+  });
+
+  return merged;
+};
+
+const isMinorRegistrationDateMismatch = (row) => {
+  if (normalizeKey(row.field) !== 'registrationdate') return false;
+  const documentText = normalizeDocName(`${row.document || ''} ${row.reason || ''}`);
+  if (!documentText.includes('business registration certificate') || !documentText.includes('form 1')) return false;
+
+  const leftDate = parseDateValue(row.documentValue);
+  const rightDate = parseDateValue(row.systemValue);
+  if (!leftDate || !rightDate) return normalizeComparable(row.reason || '').includes('minor discrepancy');
+
+  const days = Math.abs(leftDate.getTime() - rightDate.getTime()) / (24 * 60 * 60 * 1000);
+  return days <= 3;
+};
+
+const isAoAOperationalNatureMismatch = (row, systemData, documentData) => {
+  if (normalizeKey(row.field) !== 'natureofbusiness') return false;
+  const documentText = normalizeDocName(`${row.document || ''} ${row.reason || ''}`);
+  if (!documentText.includes('articles of association')) return false;
+  return !hasRegulatedOperationalNature(systemData, documentData);
+};
+
+const isIdentityTypeOnlyMismatch = (row) => {
+  const text = normalizeComparable(`${row.field || ''} ${row.reason || ''} ${row.rule || ''}`);
+  const hasIdentityReference = /\b(nic|passport|identity|id|director)\b/.test(text);
+  const hasMismatchReference = /\b(mismatch|inconsistent|inconsistency|not match|different|conflict)\b/.test(text);
+  if (!hasIdentityReference || !hasMismatchReference) return false;
+
+  if (hasCrossTypeIdentityPair(row.documentValue, row.systemValue)) return true;
+  if (!isBlank(row.documentValue) || !isBlank(row.systemValue)) return false;
+  if (hasCrossTypeIdentityPair(row.value, row.rule || row.reason || '')) return true;
+  return !isBlank(row.value) && hasMixedIdentityTypesInText(`${row.value || ''} ${row.reason || ''} ${row.rule || ''}`);
+};
+
+const isAoAAttestationDateIssue = (row = {}) => {
+  const docText = normalizeKey(normalizeDocName(`${row.document || ''} ${row.section || ''} ${row.field || ''}`));
+  if (!docText.includes('articlesofassociation')) return false;
+
+  const text = normalizeComparable(`${row.reason || ''} ${row.rule || ''} ${row.value || ''}`);
+  return /\b(attestation|certified true copy|certification|true copy)\b/.test(text)
+    && /\b(date|dated|older|expired|stale|month|months|within)\b/.test(text);
+};
+
+const isSecretaryChangePromptMismatch = (row) => {
+  const fieldNorm = normalizeKey(row.field);
+  if (!fieldNorm.includes('secretary')) return false;
+  const documentText = normalizeDocName(`${row.document || ''} ${row.reason || ''}`);
+  return documentText.includes('form 1') && documentText.includes('board resolution');
+};
+
+const shouldSuppressAiCrossDocumentMismatch = (row, systemData, documentData) => (
+  row.category === 'ai_cross_document_mismatch'
+  && (
+    isMinorRegistrationDateMismatch(row)
+    || isAoAOperationalNatureMismatch(row, systemData, documentData)
+    || isIdentityTypeOnlyMismatch(row)
+    || isSecretaryChangePromptMismatch(row)
+  )
+);
+
+const shouldSuppressDocumentOnlyRow = (row) => {
+  const fieldNorm = normalizeKey(row.field || '');
+  const documentNorm = normalizeDocName(row.document || '');
+
+  if ([
+    'firstname', 'lastname', 'middlename', 'dateofbirth', 'gender',
+    'nationality', 'documenttype', 'expirydate', 'certified',
+    'registeredauthority', 'typeofcompany', 'legalstatus',
+    'sharecapital', 'shareholderrights', 'registeredoffice',
+    'listofdirectorssecretaries', 'signaturesfound',
+    'currency', 'statementdate', 'copyrightsensitiveproductsdetected',
+    'termsandcondition', 'refundpolicyfound', 'changes',
+  ].includes(fieldNorm)) return true;
+
+  if (fieldNorm.includes('directorinformation') || fieldNorm.includes('secretary')) return true;
+  if (documentNorm.includes('articles of association') && fieldNorm === 'natureofbusiness') return true;
+
+  return false;
 };
 
 const validateValue = ({ fieldName, fieldLabel, fieldType, value, source, document }) => {
@@ -903,9 +1317,20 @@ const validateValue = ({ fieldName, fieldLabel, fieldType, value, source, docume
     if (digits.length < 7 || digits.length > 15) add('Must contain a valid contact number.');
   }
 
-  if (key.includes('nic') || key.includes('nationalidentity')) {
-    if (!/^(\d{9}[vxVX]|\d{12})$/.test(text.replace(/\s/g, ''))) {
-      add('Sri Lankan NIC must be 9 digits plus V/X or 12 digits.');
+  if (isIdentityComparisonContext(key)) {
+    // Only validate NIC format when the source document is an identity document.
+    // Fields like "NIC/Passport/DL Number" can appear in Form 01 as company IDs or
+    // other reference numbers — those must not be rejected as malformed NICs.
+    const docNorm = normalizeDocName(document || '');
+    const isIdentityDoc = docNorm.includes('identity') || docNorm.includes('passport') || docNorm.includes('driving');
+    if (isIdentityDoc) {
+      const tokens = extractIdentityTokens(text);
+      const valuesToCheck = tokens.length ? tokens : [text];
+      const invalidTokens = valuesToCheck.filter((token) => !isValidIdentityToken(token));
+      if (invalidTokens.length) {
+        add('Sri Lankan NIC must be 9 digits plus V/X or 12 digits (or a valid passport number).');
+      }
+      return issues;
     }
   }
 
@@ -914,9 +1339,13 @@ const validateValue = ({ fieldName, fieldLabel, fieldType, value, source, docume
     if (!date) {
       add('Must be a valid date.');
     } else if (key.includes('expiry') || key.includes('expire') || key.includes('validuntil')) {
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-      if (date < today) add('Document or license date is expired.');
+      // Only check expiry for system API data — AI document extraction dates may be historical
+      // or misidentified by the AI, producing false positives for old but re-validated documents.
+      if (source !== SOURCE_DOCUMENTS) {
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        if (date < today) add('Document or license date is expired.');
+      }
     }
   }
 
@@ -951,6 +1380,329 @@ const aiExtractedValue = (item) => firstValueByKeys(item, [
 const promptCoverageItems = (documentData) => aiArraysFor(documentData, AI_FIELD_COVERAGE_KEYS)
   .filter((item) => isPlainObject(item) && !isIgnoredItemSource(item));
 
+const isStakeholderCoverageItem = (item) => {
+  const sectionNorm = normalizeKey(aiSection(item) || '');
+  const sourceNorm = normalizeKey(aiSource(item, ''));
+  return (
+    sectionNorm === 'ownerinformation'
+    || sectionNorm === 'owners'
+    || sectionNorm === 'directors'
+    || sectionNorm === 'stakeholders'
+    || sourceNorm.includes('stakeholder')
+  );
+};
+
+const shouldSkipPromptSystemComparison = ({ section, field, documentName }) => {
+  const sectionNorm = normalizeKey(section || '');
+  const fieldNorm = normalizeKey(field || '');
+  const docNorm = normalizeDocName(documentName || '');
+
+  if (
+    ['ownerinformation', 'owners', 'stakeholders'].includes(sectionNorm)
+    && ['firstname', 'lastname', 'middlename'].includes(fieldNorm)
+  ) return true;
+
+  if (sectionNorm === 'directors' && fieldNorm === 'designation') return true;
+  if (fieldNorm === 'natureofbusiness' && (
+    sectionNorm === 'articlesofassociationdetails'
+    || docNorm.includes('articles of association')
+  )) return true;
+
+  return false;
+};
+
+const isNonBlockingPromptCoverageMissing = ({ section, field, documentName, reason }) => {
+  const sectionNorm = normalizeKey(section || '');
+  const fieldNorm = normalizeKey(field || '');
+  const docNorm = normalizeDocName(documentName || '');
+  const reasonNorm = normalizeComparable(reason || '');
+
+  if (
+    fieldNorm === 'sharecapital'
+    && (sectionNorm === 'articlesofassociationdetails' || docNorm.includes('articles of association'))
+  ) return true;
+
+  if (['firstname', 'lastname', 'middlename'].includes(fieldNorm) && reasonNorm.includes('corporate entity')) {
+    return true;
+  }
+
+  return false;
+};
+
+const isCorporateSecretaryCoverageGroup = (item, stakeholderRouting) => {
+  const sectionNorm = normalizeKey(aiSection(item) || '');
+  if (!['ownerinformation', 'owners', 'stakeholders'].includes(sectionNorm)) return false;
+
+  const group = stakeholderRouting.groupByItem.get(item);
+  const text = (group?.items || [item]).map((groupItem) => [
+    aiField(groupItem, ''),
+    aiExtractedValue(groupItem),
+    aiReason(groupItem, ''),
+    aiDocument(groupItem, ''),
+  ].map(searchableText).join(' ')).join(' ');
+
+  return /\b(pvt|private limited|limited liability|company registration|corporate entity|secretary registration|sec\s*frm)\b/i
+    .test(text.replace(/[\/_-]+/g, ' '));
+};
+
+const flattenNameValues = (value) => {
+  if (Array.isArray(value)) return value.flatMap(flattenNameValues);
+  if (isPlainObject(value)) {
+    const directName = firstNonBlankByKeys(value, [
+      'name',
+      'fullName',
+      'full_name',
+      'companyName',
+      'company_name',
+      'Secretary',
+      'secretary',
+    ]);
+    if (directName) return [directName];
+    return Object.values(value).flatMap(flattenNameValues);
+  }
+  if (isBlank(value)) return [];
+  return [String(value)];
+};
+
+const cleanPersonOrEntityName = (value = '') => String(value || '')
+  .replace(/[()]/g, ' ')
+  .replace(/\b(director|company secretary|secretary|designation|name|reg no|registration no)\b/gi, ' ')
+  .replace(/[\/]+/g, ' ')
+  .replace(/\s+/g, ' ')
+  .trim();
+
+const isSecretaryOrCorporateEntry = (value = '') => {
+  const text = String(value || '').replace(/[\/_-]+/g, ' ');
+  return /\b(secretary|sec\s*frm|corporate entity|company registration|pvt|private limited|management solutions)\b/i.test(text);
+};
+
+const namesSemanticallyMatch = (left, right) => {
+  const leftName = cleanPersonOrEntityName(left);
+  const rightName = cleanPersonOrEntityName(right);
+  if (!leftName || !rightName) return false;
+  return valuesEqual(leftName, rightName, 'name')
+    || valuesNearMatch(leftName, rightName)
+    || tokenSimilarity(leftName, rightName) >= 0.45;
+};
+
+const listDisplay = (values = []) => values.filter(Boolean).join(', ');
+
+const extractAoADirectors = (documentData = {}) => {
+  const list = documentData?.ArticlesOfAssociationDetails?.['List of Directors/Secretaries']
+    || documentData?.ArticlesOfAssociationDetails?.ListOfDirectorsSecretaries;
+
+  if (isPlainObject(list)) {
+    return flattenNameValues(list.Directors || list.directors || [])
+      .map(cleanPersonOrEntityName)
+      .filter(Boolean);
+  }
+
+  return flattenNameValues(list)
+    .filter((entry) => !isSecretaryOrCorporateEntry(entry))
+    .map(cleanPersonOrEntityName)
+    .filter(Boolean);
+};
+
+const extractAoASecretaries = (documentData = {}) => {
+  const list = documentData?.ArticlesOfAssociationDetails?.['List of Directors/Secretaries']
+    || documentData?.ArticlesOfAssociationDetails?.ListOfDirectorsSecretaries;
+
+  if (isPlainObject(list)) {
+    return flattenNameValues(list.Secretary || list.secretary || list.Secretaries || list.secretaries || [])
+      .map(cleanPersonOrEntityName)
+      .filter(Boolean);
+  }
+
+  return flattenNameValues(list)
+    .filter(isSecretaryOrCorporateEntry)
+    .map(cleanPersonOrEntityName)
+    .filter(Boolean);
+};
+
+const extractBoardDirectors = (documentData = {}) => (
+  flattenNameValues(documentData?.DirectorChange?.['Director information from Board Resolution']
+    || documentData?.DirectorChange?.directorInformationFromBoardResolution
+    || [])
+    .map(cleanPersonOrEntityName)
+    .filter(Boolean)
+);
+
+const extractBoardSecretaries = (documentData = {}) => (
+  flattenNameValues(documentData?.SecretaryChange?.['secretary/secretaries information from Board Resolution']
+    || documentData?.SecretaryChange?.secretaryInformationFromBoardResolution
+    || [])
+    .map(cleanPersonOrEntityName)
+    .filter(Boolean)
+);
+
+const compareDocumentNameLists = (leftValues, rightValues) => {
+  const leftMissing = leftValues.filter((left) => !rightValues.some((right) => namesSemanticallyMatch(left, right)));
+  const rightMissing = rightValues.filter((right) => !leftValues.some((left) => namesSemanticallyMatch(left, right)));
+  return { leftMissing, rightMissing };
+};
+
+const coverageValueForDocField = (documentData, docIncludes, fieldNames) => {
+  const fieldKeys = fieldNames.map(normalizeKey);
+  const item = promptCoverageItems(documentData).find((coverageItem) => {
+    const docNorm = normalizeDocName(stripAiDocumentLabel(aiDocument(coverageItem, '')));
+    const fieldNorm = normalizeKey(aiField(coverageItem, ''));
+    return docIncludes.some((docPart) => docNorm.includes(docPart))
+      && fieldKeys.includes(fieldNorm)
+      && !isBlank(aiExtractedValue(coverageItem));
+  });
+  return item ? aiExtractedValue(item) : null;
+};
+
+const addAoABoardCrossChecks = (documentData, { addMismatch, addMatched }) => {
+  const aoaDirectors = extractAoADirectors(documentData);
+  const boardDirectors = extractBoardDirectors(documentData);
+
+  if (aoaDirectors.length && boardDirectors.length) {
+    const { leftMissing, rightMissing } = compareDocumentNameLists(aoaDirectors, boardDirectors);
+    if (leftMissing.length || rightMissing.length) {
+      addMismatch({
+        field: 'Director List',
+        document: 'Articles of Association vs Board Resolution',
+        documentValue: listDisplay(aoaDirectors),
+        systemValue: listDisplay(boardDirectors),
+        reason: [
+          leftMissing.length ? `AoA director(s) not seen in Board Resolution: ${listDisplay(leftMissing)}.` : '',
+          rightMissing.length ? `Board Resolution director(s) not seen in AoA: ${listDisplay(rightMissing)}.` : '',
+        ].filter(Boolean).join(' '),
+        category: 'aoa_board_cross_check',
+      });
+    } else {
+      addMatched({
+        field: 'Director List',
+        document: 'Articles of Association vs Board Resolution',
+        documentValue: listDisplay(aoaDirectors),
+        systemValue: listDisplay(boardDirectors),
+        nearMatch: true,
+      });
+    }
+  }
+
+  const aoaSecretaries = extractAoASecretaries(documentData);
+  const boardSecretaries = extractBoardSecretaries(documentData);
+  if (aoaSecretaries.length && boardSecretaries.length) {
+    const { leftMissing, rightMissing } = compareDocumentNameLists(aoaSecretaries, boardSecretaries);
+    if (leftMissing.length || rightMissing.length) {
+      addMismatch({
+        field: 'Secretary Information',
+        document: 'Articles of Association vs Board Resolution',
+        documentValue: listDisplay(aoaSecretaries),
+        systemValue: listDisplay(boardSecretaries),
+        reason: 'Company secretary information differs between the Articles of Association and Board Resolution. Confirm whether the Board Resolution is only showing a signing designation or whether the company secretary changed; if changed, latest ROC evidence is required.',
+        category: 'aoa_board_cross_check',
+      });
+    } else {
+      addMatched({
+        field: 'Secretary Information',
+        document: 'Articles of Association vs Board Resolution',
+        documentValue: listDisplay(aoaSecretaries),
+        systemValue: listDisplay(boardSecretaries),
+        nearMatch: true,
+      });
+    }
+  }
+
+  [
+    { label: 'Company Name', fields: ['Company Name', 'CompanyName', 'Registered Company Name'] },
+    { label: 'Registration Number', fields: ['Registration Number', 'RegistrationNumber', 'Company Registration Number'] },
+    { label: 'Registered Address', fields: ['Registered Address', 'RegisteredAddress', 'Registered Office', 'RegisteredOffice'] },
+  ].forEach(({ label, fields }) => {
+    const aoaValue = coverageValueForDocField(documentData, ['articles of association'], fields);
+    const boardValue = coverageValueForDocField(documentData, ['board resolution'], fields);
+    if (isBlank(aoaValue) || isBlank(boardValue)) return;
+
+    if (valuesEqual(aoaValue, boardValue, label) || valuesNearMatch(aoaValue, boardValue)) {
+      addMatched({
+        field: label,
+        document: 'Articles of Association vs Board Resolution',
+        documentValue: displayValue(aoaValue),
+        systemValue: displayValue(boardValue),
+        nearMatch: !valuesEqual(aoaValue, boardValue, label),
+      });
+      return;
+    }
+
+    addMismatch({
+      field: label,
+      document: 'Articles of Association vs Board Resolution',
+      documentValue: displayValue(aoaValue),
+      systemValue: displayValue(boardValue),
+      reason: `${label} differs between the Articles of Association and Board Resolution.`,
+      category: 'aoa_board_cross_check',
+    });
+  });
+};
+
+const buildStakeholderCoverageRouting = (coverage, systemFlatRows) => {
+  const groupByItem = new Map();
+  const groups = [];
+  const currentGroupByScope = new Map();
+
+  coverage.forEach((item) => {
+    if (!isStakeholderCoverageItem(item)) return;
+
+    const sectionNorm = normalizeKey(aiSection(item) || '');
+    const sourceNorm = normalizeKey(aiSource(item, ''));
+    const scope = sectionNorm || sourceNorm || 'stakeholder';
+    const fieldNorm = normalizeKey(aiField(item) || '');
+    let group = currentGroupByScope.get(scope);
+    const isStarterField = fieldNorm === 'fullname' || fieldNorm === 'name';
+
+    if (!group || (isStarterField && group.fieldNorms.has(fieldNorm))) {
+      group = {
+        items: [],
+        fieldNorms: new Set(),
+        identityTokens: new Set(),
+        systemPrefix: null,
+      };
+      groups.push(group);
+      currentGroupByScope.set(scope, group);
+    }
+
+    group.items.push(item);
+    group.fieldNorms.add(fieldNorm);
+    groupByItem.set(item, group);
+    extractIdentityTokens(aiExtractedValue(item)).forEach((token) => group.identityTokens.add(token));
+  });
+
+  const identityToStakeholderPrefix = new Map();
+  systemFlatRows.forEach((row) => {
+    const pathParts = String(row.path || '').split('.');
+    if (pathParts.length < 2 || !['stakeholders', 'owners'].includes(pathParts[0])) return;
+
+    const rowKey = normalizeKey(row.field || row.canonical || '');
+    const isIdentityRow = rowKey === 'id'
+      || rowKey === 'nic'
+      || rowKey.includes('passport')
+      || rowKey.includes('nationalidentity')
+      || rowKey.includes('idnumber');
+    if (!isIdentityRow) return;
+
+    const prefix = pathParts.slice(0, 2).join('.');
+    extractIdentityTokens(row.value).forEach((token) => {
+      if (!identityToStakeholderPrefix.has(token)) {
+        identityToStakeholderPrefix.set(token, prefix);
+      }
+    });
+  });
+
+  groups.forEach((group) => {
+    for (const token of group.identityTokens) {
+      const prefix = identityToStakeholderPrefix.get(token);
+      if (prefix) {
+        group.systemPrefix = prefix;
+        break;
+      }
+    }
+  });
+
+  return { groupByItem };
+};
+
 const addPromptCoverageComparisons = (documentData, systemFlatRows, {
   addMissing,
   addInvalid,
@@ -959,26 +1711,44 @@ const addPromptCoverageComparisons = (documentData, systemFlatRows, {
   addDocumentOnly,
 }) => {
   const coverage = promptCoverageItems(documentData);
+  const stakeholderRouting = buildStakeholderCoverageRouting(coverage, systemFlatRows);
+
+  // Build document → NIC map so we can route each owner document to its matching stakeholder.
+  // New-format NICs sometimes get a trailing V/X appended by OCR — normalise it away.
 
   coverage.forEach((item) => {
     const field = aiField(item);
     const documentName = aiDocument(item, aiSection(item) || 'Prompt field coverage');
     const apiSource = aiSource(item, '');
     const section = aiSection(item);
+    if (isCorporateSecretaryCoverageGroup(item, stakeholderRouting)) return;
     if (AI_METADATA_SECTION_KEYS.has(normalizeKey(section || ''))) return;
     const status = aiStatus(item);
     const present = aiBool(firstValueByKeys(item, ['present', 'isPresent', 'is_present', 'found', 'exists']));
     const required = aiBool(firstValueByKeys(item, ['required', 'isRequired', 'is_required', 'mandatory']));
     const docValue = aiExtractedValue(item);
     const reason = aiReason(item, 'Prompt-defined field is missing or invalid in the document extraction.');
-    const systemRow = findFlatValue(systemFlatRows, comparisonAliasesFor(field, section, documentName, apiSource));
+
+    const skipSystemComparison = shouldSkipPromptSystemComparison({ section, field, documentName, apiSource });
+    const stakeholderGroup = stakeholderRouting.groupByItem.get(item);
+    let systemRow;
+    if (!skipSystemComparison && stakeholderGroup?.systemPrefix) {
+      const stakeholderRows = systemFlatRows.filter((r) => String(r.path || '').startsWith(`${stakeholderGroup.systemPrefix}.`));
+      systemRow = findFlatValue(stakeholderRows, comparisonAliasesFor(field, section, documentName, apiSource));
+    }
+    if (!skipSystemComparison && !systemRow && !stakeholderGroup) {
+      systemRow = findFlatValue(systemFlatRows, comparisonAliasesFor(field, section, documentName, apiSource));
+    }
+
     const systemValue = systemRow?.value;
     const docMissing = (
       present === false
       || ['missing', 'notfound', 'absent', 'empty', 'unreadable'].includes(status)
       || (present !== true && status !== 'present' && isBlank(docValue))
     );
-    const systemMissing = !systemRow || isBlank(systemValue);
+    if (docMissing && isNonBlockingPromptCoverageMissing({ section, field, documentName, reason })) return;
+
+    const systemMissing = skipSystemComparison || !systemRow || isBlank(systemValue);
 
     if (status === 'notapplicable' || status === 'na' || required === false) return;
 
@@ -1041,6 +1811,8 @@ const addPromptCoverageComparisons = (documentData, systemFlatRows, {
       return;
     }
 
+    if (skipSystemComparison) return;
+
     if (systemMissing) {
       addDocumentOnly({
         field,
@@ -1101,6 +1873,7 @@ const addAiPromptFindings = (documentData, { addMissing, addInvalid, addMismatch
     const reason = aiReason(item, 'Prompt-defined field is missing or invalid in the document extraction.');
 
     if (status === 'notapplicable' || status === 'na' || required === false) return;
+    if (isNonBlockingPromptCoverageMissing({ section: aiSection(item), field, documentName: document, reason })) return;
 
     if (
       present === false
@@ -1134,6 +1907,12 @@ const addAiPromptFindings = (documentData, { addMissing, addInvalid, addMismatch
     const section = isPlainObject(item) ? aiSection(item) : null;
     if (isPlainObject(item) && isIgnoredItemSource(item)) return;
     if (isPlainObject(item) && AI_METADATA_SECTION_KEYS.has(normalizeKey(section || ''))) return;
+    if (isPlainObject(item) && isNonBlockingPromptCoverageMissing({
+      section,
+      field,
+      documentName: aiDocument(item, section || 'Prompt missing field'),
+      reason: aiReason(item, ''),
+    })) return;
     addMissing({
       field,
       source: SOURCE_DOCUMENTS,
@@ -1249,6 +2028,7 @@ const buildVerificationReport = ({
   const documentFlatRows = documents.flatMap((document) => (
     flattenObject(document.fields).map((row) => ({ ...row, document: document.documentType }))
   ));
+  const effectiveRequirements = mergeDynamicLicenseRequirements(requirements, documentData, systemData);
   // Strip internal/operational WebXPay fields so they don't appear as system-only rows.
   const systemFlatRows = flattenObject(systemData || {}).filter(
     (row) => !SYSTEM_SKIP_CANONICAL.has(row.canonical)
@@ -1280,7 +2060,7 @@ const buildVerificationReport = ({
     addUnique(matchedData, row, [row.field, row.document, row.documentValue, row.systemValue]);
   };
 
-  requirements.forEach((requirement) => {
+  effectiveRequirements.forEach((requirement) => {
     const matchedDocument = findMatchingDocument(requirement, documents, uploadedDocNames);
     const isMandatory = Boolean(requirement.is_mandatory);
 
@@ -1386,6 +2166,8 @@ const buildVerificationReport = ({
     includeMissingFields: !promptCoverageCount,
   });
 
+  addAoABoardCrossChecks(documentData, { addMismatch, addMatched });
+
   if (Array.isArray(documentData?.FaultyDocument)) {
     documentData.FaultyDocument.forEach((fault) => {
       const documentName = fault['Document Name'] || fault.document_name || fault.name || 'Faulty document';
@@ -1419,6 +2201,14 @@ const buildVerificationReport = ({
         ? (remarks[documentName] || remarks[String(requiredDoc.document_id)] || remarks[String(requiredDoc.id)])
         : null;
 
+      if (!shouldKeepAiRequiredDocument({
+        documentName,
+        reason: remark || '',
+        requirements: effectiveRequirements,
+        systemData,
+        documentData,
+      })) return;
+
       // Skip if a matching document is already present/invalid — it has its own row.
       if (presentOrInvalidDocNames.some((name) => namesMatch(name, documentName))) return;
 
@@ -1432,10 +2222,68 @@ const buildVerificationReport = ({
     });
   }
 
-  const cleanMissing = stripKeys(missingData);
-  const cleanInvalid = stripKeys(invalidData);
-  const cleanMismatches = stripKeys(mismatches);
-  const cleanDocumentOnly = stripKeys(documentOnlyData);
+  // AI-flagged missing/invalid items for non-mandatory documents must not produce a fail row.
+  // Only keep them if: (a) the DB has no matching requirement (AI may know something we don't),
+  // OR (b) the matching DB requirement is mandatory.
+  const isNonMandatoryAiDoc = (row) => {
+    if (row.category !== 'ai_required_document'
+      && row.category !== 'ai_document_presence') return false;
+    const docName = String(row.field || row.document || '');
+    if (isRegulatoryLicenseRequirement(docName, row.reason || '') && hasRegulatedOperationalNature(systemData, documentData)) {
+      return false;
+    }
+    const matchedReq = effectiveRequirements.find((req) => namesMatch(req.required_docs, docName));
+    return Boolean(matchedReq) && !matchedReq.is_mandatory;
+  };
+
+  const policyFilteredMismatches = mismatches.filter(
+    (row) => !shouldSuppressAiCrossDocumentMismatch(row, systemData, documentData)
+  );
+
+  // Fields already seen in matched/mismatch/invalid rows don't need a separate Missing entry.
+  // This suppresses prompt_field_comparison noise for fields like Country, City, Business Email
+  // that are "not found in BRC" but ARE matched from another document (e.g. Duly Filled Agreement).
+  const foundFieldKeys = new Set(
+    [
+      ...matchedData.map((r) => normalizeKey(r.field || '')),
+      ...policyFilteredMismatches.map((r) => normalizeKey(r.field || '')),
+      ...invalidData.map((r) => normalizeKey(r.field || '')),
+    ].filter(Boolean),
+  );
+
+  const cleanMissing = stripKeys(missingData).filter((row) => {
+    if (isNonMandatoryAiDoc(row)) return false;
+    if (
+      row.category === 'prompt_field_comparison'
+      && String(row.documentValue || '').toLowerCase() === '(not found)'
+      && foundFieldKeys.has(normalizeKey(row.field || ''))
+    ) return false;
+    if (row.category !== 'ai_required_document' && row.category !== 'ai_document_presence') return true;
+    return !isNonMandatoryAiDoc(row);
+  });
+  // Fields already covered by a CrossDocumentMismatch row don't need a separate invalid entry —
+  // the mismatch already surfaces the inconsistency and adding an invalid row for the same field
+  // creates confusing duplicate rows (e.g. "Nature of Business" appearing as both Mismatch and Invalid).
+  const crossDocMismatchFieldKeys = new Set(
+    policyFilteredMismatches
+      .filter((r) => r.category === 'ai_cross_document_mismatch')
+      .map((r) => normalizeKey(r.field || ''))
+  );
+
+  const cleanInvalid = stripKeys(invalidData).filter((row) => {
+    if (isNonMandatoryAiDoc(row)) return false;
+    if (isAoAAttestationDateIssue(row)) return false;
+    if (isIdentityTypeOnlyMismatch(row)) return false;
+    // Document-level AI findings (whole-document flags: label mismatches, duplicates,
+    // attestation issues) are too unreliable to be blocking. Field-level invalids
+    // (ai_invalid_data, ai_prompt_field) are kept.
+    if (row.category === 'ai_faulty_document') return false;
+    // Suppress prompt-field invalids when the same field already has a cross-document mismatch row
+    if (row.category === 'ai_prompt_field' && crossDocMismatchFieldKeys.has(normalizeKey(row.field || ''))) return false;
+    return true;
+  });
+  const cleanMismatches = stripKeys(policyFilteredMismatches);
+  const cleanDocumentOnly = stripKeys(documentOnlyData).filter((row) => !shouldSuppressDocumentOnlyRow(row));
   const cleanSystemOnly = stripKeys(systemOnlyData);
   const cleanMatched = stripKeys(matchedData);
 
@@ -1450,7 +2298,20 @@ const buildVerificationReport = ({
     ...cleanMismatches,
   ].filter(isAiPromptIssue).length;
 
+  const blockingCount = cleanMissing.length + cleanMismatches.length + cleanInvalid.length;
   const ruleChecks = [
+    {
+      name: 'Onboarding eligibility',
+      status: blockingCount === 0 ? 'pass' : 'fail',
+      detail: blockingCount === 0
+        ? 'No blocking issues detected. This merchant appears eligible for onboarding.'
+        : `Cannot onboard: ${[
+            cleanMissing.length   ? `${cleanMissing.length} missing item(s)`      : '',
+            cleanMismatches.length ? `${cleanMismatches.length} data mismatch(es)` : '',
+            cleanInvalid.length   ? `${cleanInvalid.length} invalid field(s)`      : '',
+          ].filter(Boolean).join(', ')} must be resolved before approval.`,
+      isVerdict: true,
+    },
     {
       name: 'Required data coverage',
       status: cleanMissing.length ? 'fail' : 'pass',
@@ -1620,6 +2481,93 @@ const buildVerificationReport = ({
     return true;
   });
 
+  // ── Document validity checks ──────────────────────────────────────────────
+  // One row per DB requirement: present? valid? any AI-flagged issues?
+
+  // Strip "LABEL: " prefix and " | API_SOURCE: ..." suffix that the AI adds to document names.
+  const stripDocLabel = (name) => String(name || '')
+    .replace(/^LABEL:\s*/i, '')
+    .replace(/\s*\|\s*API_SOURCE:\s*.*/i, '')
+    .replace(/_/g, ' ')
+    .trim();
+
+  // FaultyDocument → normalised doc name → [reason strings]
+  const faultsByDoc = new Map();
+  if (Array.isArray(documentData?.FaultyDocument)) {
+    documentData.FaultyDocument.forEach((fault) => {
+      const documentName = stripDocLabel(fault['Document Name'] || fault.document_name || fault.name || '');
+      const reason = fault.Reason || fault.reason || fault.issue || '';
+      if (isAoAAttestationDateIssue({ document: documentName, field: documentName, reason })) return;
+
+      const key = normalizeDocName(documentName);
+      if (!key) return;
+      if (!faultsByDoc.has(key)) faultsByDoc.set(key, []);
+      if (reason) faultsByDoc.get(key).push(reason);
+    });
+  }
+
+  // PromptFieldCoverage invalid/expired items → normalised doc name → [{field, reason}]
+  const invalidFieldsByDoc = new Map();
+  promptCoverageItems(documentData).forEach((item) => {
+    const st = aiStatus(item);
+    if (!['invalid', 'expired', 'faulty', 'failed'].includes(st)) return;
+    const key = normalizeDocName(stripDocLabel(aiDocument(item, '')));
+    if (!key) return;
+    const invalidField = {
+      field: aiField(item) || 'Unknown field',
+      reason: aiReason(item, 'Field failed validation.'),
+    };
+    if (isAoAAttestationDateIssue({ document: key, ...invalidField })) return;
+    if (!invalidFieldsByDoc.has(key)) invalidFieldsByDoc.set(key, []);
+    invalidFieldsByDoc.get(key).push(invalidField);
+  });
+
+  const docIssues = (reqName) => {
+    const reqKey = normalizeDocName(stripDocLabel(reqName));
+    const faults = [];
+    const invalidFields = [];
+    faultsByDoc.forEach((reasons, key) => { if (namesMatch(key, reqKey)) faults.push(...reasons); });
+    invalidFieldsByDoc.forEach((fields, key) => { if (namesMatch(key, reqKey)) invalidFields.push(...fields); });
+    return { faults, invalidFields };
+  };
+
+  const documentChecks = effectiveRequirements.map((req) => {
+    const name = req.required_docs;
+    const reqKey = normalizeDocName(stripDocLabel(name));
+
+    const present = apiDocLabels.some((label) => namesMatch(normalizeDocName(stripDocLabel(label)), reqKey))
+      || uploadedDocNames.some((label) => namesMatch(normalizeDocName(label), reqKey));
+
+    const { faults, invalidFields } = docIssues(name);
+
+    const linkedInvalids = cleanInvalid
+      .filter((r) => r.category === 'ai_prompt_field'
+        && namesMatch(normalizeDocName(stripDocLabel(r.document || '')), reqKey))
+      .map((r) => ({ field: r.field, reason: r.rule || '' }));
+
+    const allIssues = [
+      ...faults.map((r) => ({ type: 'document', field: null, reason: r })),
+      ...invalidFields.map((f) => ({ type: 'field', field: f.field, reason: f.reason })),
+      ...linkedInvalids.map((f) => ({ type: 'field', field: f.field, reason: f.reason })),
+    ];
+    const seenIssues = new Set();
+    const uniqueIssues = allIssues.filter((issue) => {
+      const k = `${issue.type}|${issue.field || ''}|${issue.reason}`;
+      if (seenIssues.has(k)) return false;
+      seenIssues.add(k);
+      return true;
+    });
+
+    return {
+      name,
+      description: req.description || null,
+      isMandatory: Boolean(req.is_mandatory),
+      present,
+      valid: !present ? false : uniqueIssues.length === 0,
+      issues: uniqueIssues,
+    };
+  });
+
   return {
     mid: mid || null,
     merchantChannel: merchantChannel || null,
@@ -1631,7 +2579,7 @@ const buildVerificationReport = ({
       : (status === 'source_gap_review' ? 'Source gap review' : 'Review required'),
     summary: {
       receivedDocuments: apiDocLabels.length || documents.length,
-      configuredRequirements: requirements.length,
+      configuredRequirements: effectiveRequirements.length,
       matchedFields: cleanMatched.length,
       missingData: cleanMissing.length,
       invalidData: cleanInvalid.length,
@@ -1653,9 +2601,122 @@ const buildVerificationReport = ({
     systemOnlyData: cleanSystemOnly,
     matchedData: cleanMatched,
     ruleChecks,
+    documentChecks,
+  };
+};
+
+// Move AI-confirmed compatible mismatches from mismatches → matchedData (nearMatch=true)
+// and recalculate status, summary, and rule checks in the report.
+const patchReportCompatibleMismatches = (report, compatibleFields) => {
+  if (!compatibleFields || !compatibleFields.size) return report;
+
+  const normalizedCompatible = new Set([...compatibleFields].map((f) => normalizeKey(f)));
+
+  const keptMismatches = [];
+  const movedToMatched = [];
+  (report.mismatches || []).forEach((m) => {
+    if (normalizedCompatible.has(normalizeKey(m.field || ''))) {
+      movedToMatched.push(m);
+    } else {
+      keptMismatches.push(m);
+    }
+  });
+
+  if (!movedToMatched.length) return report;
+
+  const newMatchedData = [
+    ...(report.matchedData || []),
+    ...movedToMatched.map((m) => ({
+      field: m.field,
+      document: m.document || '—',
+      documentValue: m.documentValue || '—',
+      systemValue: m.systemValue || '—',
+      nearMatch: true,
+    })),
+  ];
+
+  const newUnifiedRows = [
+    ...(report.unifiedRows || []).filter(
+      (r) => !(r.status === 'mismatch' && normalizedCompatible.has(normalizeKey(r.field || '')))
+    ),
+    ...movedToMatched.map((m) => ({
+      field: m.field,
+      document: m.document || '—',
+      aiValue: m.documentValue || '—',
+      apiValue: m.systemValue || '—',
+      status: 'matched',
+      nearMatch: true,
+      comment: 'Needs review: values are semantically compatible but described differently across documents. Confirm before approving.',
+    })),
+  ];
+
+  const blockingCount = (report.missingData || []).length + keptMismatches.length + (report.invalidData || []).length;
+  const newStatus = blockingCount > 0
+    ? 'review_required'
+    : ((report.documentOnlyData || []).length + (report.systemOnlyData || []).length > 0
+      ? 'source_gap_review'
+      : 'verified');
+
+  const aiPromptIssueCount = [
+    ...(report.missingData || []),
+    ...(report.invalidData || []),
+    ...keptMismatches,
+  ].filter((r) => String(r.category || '').startsWith('ai_')).length;
+
+  const newRuleChecks = (report.ruleChecks || []).map((check) => {
+    if (check.isVerdict) {
+      return {
+        ...check,
+        status: blockingCount === 0 ? 'pass' : 'fail',
+        detail: blockingCount === 0
+          ? 'No blocking issues detected. This merchant appears eligible for onboarding.'
+          : `Cannot onboard: ${[
+              (report.missingData || []).length ? `${report.missingData.length} missing item(s)` : '',
+              keptMismatches.length ? `${keptMismatches.length} data mismatch(es)` : '',
+              (report.invalidData || []).length ? `${report.invalidData.length} invalid field(s)` : '',
+            ].filter(Boolean).join(', ')} must be resolved before approval.`,
+      };
+    }
+    if (check.name === 'Google AI document extraction vs external system cross-check') {
+      return {
+        ...check,
+        status: keptMismatches.length ? 'fail' : 'pass',
+        detail: keptMismatches.length
+          ? `${keptMismatches.length} field(s) do not match between sources.`
+          : 'Compared fields match across both sources.',
+      };
+    }
+    if (check.name === 'Prompt merchant-type rules') {
+      return {
+        ...check,
+        status: aiPromptIssueCount ? 'fail' : 'pass',
+        detail: aiPromptIssueCount
+          ? `${aiPromptIssueCount} prompt-driven document or field rule issue(s) were reported by Google AI.`
+          : 'No prompt-driven merchant-type rule issues were reported by Google AI.',
+      };
+    }
+    return check;
+  });
+
+  return {
+    ...report,
+    status: newStatus,
+    statusLabel: newStatus === 'verified'
+      ? 'Verified'
+      : (newStatus === 'source_gap_review' ? 'Source gap review' : 'Review required'),
+    summary: {
+      ...(report.summary || {}),
+      matchedFields: newMatchedData.length,
+      mismatches: keptMismatches.length,
+    },
+    mismatches: keptMismatches,
+    matchedData: newMatchedData,
+    unifiedRows: newUnifiedRows,
+    ruleChecks: newRuleChecks,
   };
 };
 
 module.exports = {
   buildVerificationReport,
+  patchReportCompatibleMismatches,
 };

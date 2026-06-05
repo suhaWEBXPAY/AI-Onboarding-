@@ -135,6 +135,14 @@ IMPORTANT RULES
 **Always extract and present all data fields, even from faulty, expired, substitute, or incomplete documents, for admin review and possible override.**
 If a director/secretary document is a certified true copy, clearly annotate it in the extracted data and verify the certifying authority, seal, and date (must be within 3 months). Otherwise, treat as FaultyDocument.
 
+**Universal Date Comparison Rules — applies to EVERY date field in EVERY document:**
+- The reference date (TODAY) is injected at the top of this prompt. You MUST use that exact value for all date comparisons. NEVER substitute your model training cutoff or any assumed "current" date.
+- A date is "in the future" ONLY if it is provably STRICTLY AFTER the reference date under every reasonable format interpretation. If any reasonable interpretation places the date on or before the reference date, do NOT flag it as future.
+- **Year-level shortcut:** Any date whose year is numerically less than the reference year is ALWAYS in the past — never flag it as future, regardless of month or day values. Example: if the reference date is 2026-06-03, then any date in 2025 (e.g. 2025-10-04, 2025-12-31) is unconditionally in the past.
+- **Same-year dates:** A date is future only when its month AND day are both provably later than the reference month and day. Example: 2026-03-20 is NOT future relative to 2026-06-03 because month 03 < month 06.
+- **Format ambiguity (YYYY-MM-DD vs YYYY-DD-MM vs DD-MM-YYYY etc.):** Sri Lankan documents use mixed formats. When the format is ambiguous, try all plausible interpretations. Only flag as future if ALL interpretations yield a date strictly after the reference date. If any interpretation yields a valid past date, use that interpretation and do NOT raise a future-date flag.
+- This rule applies without exception to: registration dates, incorporation dates, commencement dates, board/resolution/meeting dates, agreement dates, certification dates, NIC/passport issue dates, and any other date field extracted from any document.
+
 ---
 
 #### Documents you may receive:
@@ -154,7 +162,7 @@ If a director/secretary document is a certified true copy, clearly annotate it i
 
 1. **Extract and Structure Fields:**
    - Extract all available data from every document, including full director/secretary details, business registration info, shareholders, amendments, and signatures.
-   - Output an array under OwnerInformation for all directors/secretaries (from all submitted IDs).
+   - Output an array under OwnerInformation only for natural-person directors/owners from submitted ID documents. Do NOT put a corporate company secretary entity (for example a "(PVT) LTD" secretary or SEC/FRM registration) in OwnerInformation; place it under SecretaryChange or List of Directors/Secretaries instead.
    - If any ID is a certified true copy, annotate as "certified", and include certifier, seal, and attestation date in the data if available.
    - Extract Form 1 and AoA secretary/secretary information.
    - Commencement date is not Registered Date.
@@ -164,33 +172,34 @@ If a director/secretary document is a certified true copy, clearly annotate it i
        - For BRC compliance decisioning, treat the above fields as the mandatory checks.
      - **Form 01 (at incorporation):** Director Names, NIC/Passport Numbers, Addresses, Secretary details, Registered Office.
      - **Form 20 (latest directors):** latest/current director names and latest company officer changes.
-     - **Articles of Association (AoA):** Company Name, Registration Number, Share Capital Structure, Nature of Business.
+     - **Articles of Association (AoA):** Company Name, Registration Number, Share Capital Structure, Nature of Business. If a specific numeric share-capital amount is not stated but shareholder/share restrictions or share rights are present, record the available structure and do NOT mark Share Capital as missing.
    - Auto-match citizenship and nationality from the director address whenever possible. If the address indicates Sri Lanka, set both as "Sri Lankan".
 
 2. **Cross-Check Consistency:**
    - Cross-check names, NICs, and addresses of directors/secretaries.
    - Verify Business Name, Registration Number, Address across BRC and AoA only. **Do NOT require the website/URL business name to match the BRC registered name — a mismatch is NOT a compliance failure. Log it as a Warning only and do not block onboarding.**
-   - Compare Board Resolution, Form 01, Form 20 (if available), and AoA for director/secretary changes or amendments.
+   - Compare Board Resolution, Articles of Association (AoA), Form 01, and Form 20 (if available) for director/secretary consistency and amendments.
+   - Always cross-check AoA against Board Resolution for company name, registration number, registered address/office, director list, and secretary/company-secretary information. If directors differ, report a blocking mismatch unless a valid Form 20 or ROC change document explains the change.
+   - If the secretary/company secretary in AoA or Form 01 differs from the Board Resolution, decide whether the Board Resolution merely shows a signing title or actually indicates a secretary change. If it indicates a secretary change and no latest ROC evidence is provided, add the required ROC evidence/Form 20 to required_documents and set canOnboard=false. If it is only signing-title wording, log a Warning only. **CRITICAL: Do NOT add a signing-title secretary difference to CrossDocumentMismatches under any circumstances. It belongs in Warnings only. "Director/Company Secretary" as a designation on a Board Resolution is a signing title, not a secretary identity — it must never appear as a CrossDocumentMismatch entry.**
    - Validate ROC verification and payment details from all regulatory forms.
    - Set an internal flag if amendments are found in AoA.
 
 3. **Detect Director or Secretary Changes:**
    - Always compare director/secretary lists between Board Resolution, AoA, Form 01, and Form 20 (when available).
    - **Form 01 is the first incorporation snapshot. Form 20 is the latest/current director list and MUST be prioritized when available.**
-   - Always use both Form 01 and Form 20 to confirm current directors. Do not rely on one form alone.
    - Business Registration may contain historical officer references; do NOT use BRC officer names as the source of truth for current directors.
-   - If Form 20 is missing and there are any differences between Board Resolution, AoA, and Form 01 (even subtle differences), you MUST add "Form 20" to required_documents with a clear explanation in remarks.
-   - If Form 20 is available but conflicts with IDs or Board Resolution signatories, add the relevant supporting ROC change/resolution evidence to required_documents with clear remarks.
+   - **Form 20 is only required when director details in Form 01 do NOT match the submitted Director/Secretary ID copies (NIC/Passport/DL).** Specifically: if director names or same-type ID numbers in Form 01 are inconsistent with the submitted ID documents, add "Form 20" to required_documents with a clear explanation. Do NOT treat a Form 01 NIC and a submitted passport number as a mismatch by themselves; they are different identifier types and may both be valid for the same director. If Form 01 and the submitted ID copies identify the same people, Form 20 is NOT required — do NOT add it to required_documents even if Board Resolution or AoA wording differs slightly.
+   - Do NOT require Form 20 solely because secretary wording differs between Form 01 and Board Resolution, or because a Board Resolution signatory is described as "Director/Company Secretary". Log this as a Warning only unless director names or director NIC/passport numbers in Form 01 conflict with the submitted ID documents.
+   - If Form 20 is submitted and conflicts with IDs or Board Resolution signatories, add the relevant supporting ROC change/resolution evidence to required_documents with clear remarks.
    - If a company name change is detected, you MUST add "Form 3/4" (for company name change) to required_documents.
    - If a business address change is detected, you MUST add "Form 13" (for address change) to required_documents.
    - If AoA amendments are found, you MUST add "Form 39" to required_documents.
-   - If any director/secretary is present in one list but not in the others, or if the director/secretary lists are not exactly aligned across Board Resolution, AoA, Form 01, and Form 20 (if available), ALWAYS add the relevant form to required_documents and give the reason in remarks.
 
 
 
 4. **Identify Missing/Required Documents:**
    - Apply these rules:
-     - **NIC address ≠ BRC:** require Address Verification Document.
+     - **NIC address ≠ BRC:** log to Warnings only (non-blocking). Do NOT add "Address Verification Document" to required_documents or FaultyDocument — it is not a mandatory requirement.
      - **Passport or DL expired:** require Valid Identification Document.
      - **Nature of Business Declaration Letter is NOT mandatory for Private/Public Limited companies.** Extract nature of business from BRC and/or AoA instead. Do NOT request a Nature of Business Declaration Letter unless nature of business is completely absent from both BRC and AoA.
      - **Nature of Business Letter / Nature of Business Declaration Letter is optional and non-blocking for Private/Public Limited.** Missing it must NOT be treated as a failure by itself: do NOT add it to FaultyDocument, do NOT add it to required_documents, and do NOT set canOnboard=false for this reason alone.
@@ -198,10 +207,23 @@ If a director/secretary document is a certified true copy, clearly annotate it i
      - **Copyright-sensitive content:** require Copyright Authorization.
 
 5. **Regulated Merchant Types & Licenses:**
-   - Determine Nature of Business from BRC or AoA — NOT from a Nature of Business Declaration Letter (which is optional and not required).
+   - Determine the operating Nature of Business by cross-checking BOTH the **Board Resolution** AND the **Articles of Association (AoA)**. These are the two primary sources. Do NOT use the Duly Filled Agreement for this purpose.
+   - Read the Board Resolution carefully for the stated/approved operating activity. Read the AoA's full text — both the objects clause AND any statements about regulatory approvals or conditions.
+
+   **Two-tier AoA license rule:**
+
+   **Tier 1 — AoA explicitly states regulatory approval/license is required:**
+   If the AoA text itself states that certain activities require regulatory approval (e.g., "requires approval from the Ayurvedic Department", "requires NMRA approval", "requires a license from…"), those licenses are **MANDATORY** regardless of what the Board Resolution says about current operating activity. The company's own constitutional document declaring a license is needed is authoritative — the Board Resolution's stated activity cannot override an explicit approval requirement written into the AoA. Add every such license to required_documents, set each as FaultyDocument if missing, and set canOnboard=false.
+
+   **Tier 2 — AoA only lists regulated activities as objects (no explicit approval statement):**
+   If the AoA merely lists regulated business activities as objects/purposes but does NOT explicitly state that regulatory approval is required for them, AND the Board Resolution clearly shows the current operating activity is non-regulated (e.g., spices, grocery, general retail), then log the AoA scope difference as a Warning only. Do NOT require a license based on inferred regulated-activity object clauses alone when the Board Resolution confirms a non-regulated current operation.
+
+   - If the AoA objects clause states a regulated activity (e.g., pharmacy, medical, jewellery) AND the Board Resolution confirms or does not contradict it, require the corresponding license.
    - Nature of Business must be summarized in **3-4 words** as a short description, e.g., "Wholesale Food Trading", "Retail Pharmacy Services".
-   - If Nature of Business matches a regulated industry, request the mapped license (see table below) and include in required_documents.
-   - If license is missing, expired, or inconsistent, list as FaultyDocument and in required_documents.
+   - Nature of Business must be summarized in **3-4 words** as a short description, e.g., "Wholesale Food Trading", "Retail Pharmacy Services".
+   - If the Board Resolution or other operating source shows a regulated industry, the mapped license is mandatory, not optional. Add the exact license name from the table below to required_documents and explain why it is needed.
+   - If a mandatory license is missing, expired, or inconsistent, list it as FaultyDocument and in required_documents, and set OnboardingEligibility.canOnboard=false.
+   - Do NOT check Articles of Association certified true copy attestation date/staleness for this workflow. AoA has no 3-month recency requirement here. Only flag AoA if it is missing, unreadable, incomplete, tampered, or does not contain required company content.
 
    | **Business Type**                   | **Required License**                                  |
    |-------------------------------------|-------------------------------------------------------|
@@ -235,7 +257,18 @@ If a director/secretary document is a certified true copy, clearly annotate it i
    - Provide a score from 0-100 based on the overall quality and completeness of the documents, with a clear reason for the score and store under satisfactionScore.
    - The score should reflect the overall quality of the documents, including clarity, completeness, and compliance with requirements.
 
-10. **Private Limited Consistency and Authorization Rules (Mandatory):**
+10. **PromptFieldCoverage status rules — CRITICAL:**
+   The following fields are metadata or contact details that do NOT appear on official company documents (BRC, Form 01, AoA, Board Resolution, Passport, etc.). When these fields are not found in the submitted documents, you MUST set their `status` to `"not_applicable"` — NEVER `"missing"`. Setting them to `"missing"` incorrectly blocks onboarding for information that is not on any official document.
+   - `Business Email` — email addresses are not on BRCs or official company documents
+   - `Doing Business Name` — DBA is not a field on Sri Lankan BRC or company documents for Pvt/Public Ltd
+   - `Category Code` — internal merchant category code, not on any official document
+   - `phone` (in Directors array) — personal phone numbers are not on official company documents
+   - `email` (in Directors array) — personal emails in Directors are not on official documents (Form 01 may contain an email in some cases; only mark `present` if actually found)
+   - `Postal Code` — only mark `present` if explicitly visible; use `not_applicable` if not found, not `missing`
+   - Any field in `WebsiteInsights` — mark as `not_applicable` if no website/social media document was submitted
+   Use `"missing"` ONLY for fields that are both: (a) expected on the submitted document type, and (b) not found or blank in that document.
+
+11. **Private Limited Consistency and Authorization Rules (Mandatory):**
    - **Company Name Consistency:** Must match across BRC, Bank Statement, Board Resolution, License, and AoA.
    - Allow minor formatting differences as equivalent (case-insensitive), including:
      - "(Pvt) Ltd" vs "Private Limited"
@@ -366,7 +399,6 @@ If a director/secretary document is a certified true copy, clearly annotate it i
    - score: 0-100
    - reason: Concisely explain, using strict regulatory/compliance language, if and why onboarding is or is not permitted.
 
-
 ---
 
 **Validation & Key Notes:**
@@ -375,6 +407,7 @@ If a director/secretary document is a certified true copy, clearly annotate it i
 - For every document or data item found faulty, inconsistent, expired, or missing, include a clear reason in FaultyDocument.
 - List only missing or required documents in DocumentRequirements (excluding those already in FaultyDocument).
 - Log minor OCR/format issues in Warnings only (do not block onboarding).
+- **All document dates:** Apply the Universal Date Comparison Rules (see top of prompt). Any date with a year before the reference year is always past. Never flag a date as future unless it is provably after the reference date under all reasonable format interpretations. This covers registration dates, incorporation dates, resolution dates, meeting dates, and every other date field.
 - Always extract and return all data, regardless of document validity, for admin review.
 - For regulated industries, require and verify the mapped license.
 - Treat Form 20 as the primary source for current directors when available; use Form 01 as incorporation baseline.
@@ -475,8 +508,9 @@ You are a highly detail-oriented AI compliance officer responsible for onboardin
      - **Copyright-sensitive content:** require Copyright Authorization.
 
 5. **Regulated Merchant Types & Licenses:**
-   - If Nature of Business matches a regulated industry, request the mapped license (see table below) and include in required_documents.
-   - If license is missing, expired, or inconsistent, list as FaultyDocument and in required_documents.
+   - Determine the Nature of Business from the **Business Registration Certificate (BRC)**. This is the primary source for partnership firms. Do NOT rely on any other document for nature of business determination.
+   - If Nature of Business from the BRC matches a regulated industry, the corresponding license is **mandatory**. Add it to required_documents.
+   - If license is missing, expired, or inconsistent, list as FaultyDocument and in required_documents, and set canOnboard=false.
 
    | **Business Type**                   | **Required License**                                  |
    |-------------------------------------|-------------------------------------------------------|
@@ -593,7 +627,6 @@ You are a highly detail-oriented AI compliance officer responsible for onboardin
    - score: 0-100
    - reason: Concisely explain, using strict regulatory/compliance language, if and why onboarding is or is not permitted.
 
-
 ---
 
 **Validation & Key Notes:**
@@ -602,6 +635,7 @@ You are a highly detail-oriented AI compliance officer responsible for onboardin
 - For every document or data item found faulty, inconsistent, expired, or missing, include a clear reason in FaultyDocument.
 - List only missing or required documents in DocumentRequirements (excluding those already in FaultyDocument).
 - Log minor OCR/format issues in Warnings only (do not block onboarding).
+- **All document dates:** Apply the Universal Date Comparison Rules (see top of prompt). Any date with a year before the reference year is always past. Never flag a date as future unless it is provably after the reference date under all reasonable format interpretations.
 - **Bank details are required. If any is missing or unclear, add Valid Bank Statement to required_documents and request another submission.**
 - Always extract and return all data, regardless of document validity, for admin review.
 - For regulated industries, require and verify the mapped license.
@@ -747,7 +781,6 @@ You are a highly detail-oriented AI compliance officer tasked with onboarding **
    - score: 0-100
    - reason: Concisely explain, using strict regulatory/compliance language, if and why onboarding is or is not permitted.
 
-
 ---
 
 ### Validation and Compliance Rules
@@ -761,6 +794,7 @@ You are a highly detail-oriented AI compliance officer tasked with onboarding **
 - All uploaded documents must be **certified true copies** or marked **“original sighted”** by authorized staff.
 - Extract all data—even from faulty or incomplete docs. For each document, output all expected fields.
 - Never skip any uploaded document; fill missing fields with "" or null, and mark as faulty if unreadable.
+- **All document dates:** Apply the Universal Date Comparison Rules (see top of prompt). Any date with a year before the reference year is always past. Never flag a date as future unless it is provably after the reference date under all reasonable format interpretations.
 - Only return the final structured JSON object. Do not output extra text, commentary, or summaries.
 """
 
@@ -1492,6 +1526,7 @@ Output Mapping:
 - Include a clear reason in FaultyDocument for every issue.
 - List only missing/required documents in DocumentRequirements (excluding those already in FaultyDocument).
 - Log minor OCR/format issues in Warnings only.
+- **All document dates:** Apply the Universal Date Comparison Rules (see top of prompt). Any date with a year before the reference year is always past. Never flag a date as future unless it is provably after the reference date under all reasonable format interpretations.
 - Extract and return all data, regardless of document validity, for admin review.
 - For regulated professions/activities, require and verify the mapped license.
 - Translate all Sinhala/Tamil text to English before processing.
@@ -1595,10 +1630,11 @@ You may receive OCR text from (but not limited to) these documents:
 
 4. **Expiry:**
    - All date-sensitive documents (DL, Passport, Bank Statement, License) must be current (not expired or outdated). Expired = FaultyDocument.
-   - **Board Resolution date:** NEVER flag a Board Resolution as faulty or as a "future date" unless its date is STRICTLY AFTER the reference date provided at the top of this prompt. Dates in 2025 or 2026 that are on or before today's reference date are valid. Do NOT use your model training cutoff to judge document dates.
+   - **All document dates:** Apply the Universal Date Comparison Rules (see top of prompt). Any date with a year before the reference year is always past. Never flag a date as future unless it is provably after the reference date under all reasonable format interpretations.
 
 5. **Licensing and Regulatory Documents:**
-   - If the business type or nature of business (from BRC, website, or business letter) is regulated, the corresponding **up-to-date license document** is required. If not found, expired, or inconsistent, list as FaultyDocument and add to required_documents.
+   - Determine the Nature of Business from the **Business Registration Certificate (BRC)**. This is the primary and authoritative source for sole proprietors. Do NOT use the business letter or any other document as a substitute for determining nature of business.
+   - If the Nature of Business from the BRC is regulated, the corresponding license is **mandatory**. If not found, expired, or inconsistent, list as FaultyDocument and add to required_documents, and set canOnboard=false.
    - Use this mapping:
      - Gem & Jewelry → National Gem & Jewelry Authority License
      - Hotels / Lodging / Hospitality / Travel Agents → Sri Lanka Tourism Development Authority (SLTDA) License
@@ -1763,8 +1799,6 @@ Then:
 9. **satisfactionScore:**
    - score: 0-100
    - reason: Concisely explain, using strict regulatory/compliance language, if and why onboarding is or is not permitted.
-
-
 
 ---
 

@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useLocation } from 'react-router-dom';
 import PageLayout from '../components/PageLayout';
 import api from '../services/api';
 
@@ -13,10 +14,60 @@ const coerceJsonValue = (value) => {
   }
 };
 
+const formatJsonValue = (parsed) => {
+  if (Array.isArray(parsed)) {
+    return parsed.map((item) => {
+      if (item && typeof item === 'object') {
+        if (item.name) return item.name;
+        return Object.entries(item).filter(([, v]) => v).map(([k, v]) => `${k}: ${v}`).join(', ');
+      }
+      return String(item);
+    }).join(' · ');
+  }
+  if (parsed && typeof parsed === 'object') {
+    if (parsed.name) return parsed.name;
+    return Object.entries(parsed).filter(([, v]) => v).map(([k, v]) => `${k}: ${v}`).join(', ');
+  }
+  return String(parsed);
+};
+
 const formatCell = (value) => {
   if (value === undefined || value === null || value === '') return '-';
-  if (typeof value === 'object') return JSON.stringify(value);
+  if (typeof value === 'object') return formatJsonValue(value);
+  if (typeof value === 'string') {
+    const t = value.trim();
+    if ((t.startsWith('[') || t.startsWith('{')) && (t.endsWith(']') || t.endsWith('}'))) {
+      try { return formatJsonValue(JSON.parse(t)); } catch { /* fall through */ }
+    }
+  }
   return String(value);
+};
+
+const formatDocLabel = (doc) => {
+  if (!doc || doc === '—') return doc;
+  return String(doc)
+    .split(/\s+vs\s+/i)
+    .map((part) => part
+      .split(',')
+      .map((seg) => seg
+        .replace(/LABEL:\s*/gi, '')
+        .replace(/\s*\|\s*API_SOURCE:\s*\S+/gi, '')
+        .replace(/_/g, ' ')
+        .trim()
+      )
+      .filter(Boolean)
+      .join(', ')
+    )
+    .join(' vs ');
+};
+
+const parseBold = (text) => {
+  if (!text) return null;
+  return text.split(/(\*\*[^*]+\*\*)/g).map((part, i) =>
+    part.startsWith('**') && part.endsWith('**')
+      ? <strong key={i}>{part.slice(2, -2)}</strong>
+      : part
+  );
 };
 
 const fmtDate = (value) => value
@@ -29,11 +80,6 @@ const fmtDate = (value) => value
   })
   : '-';
 
-const listStatus = (merchant) => {
-  if (!merchant?.latest_analysis_at) return { label: 'Not run', className: 'badge-optional' };
-  if (Number(merchant.can_onboard) === 1) return { label: 'Verified', className: 'badge-required' };
-  return { label: 'Review', className: 'badge-mandatory' };
-};
 
 function StatusPill({ status, label }) {
   return (
@@ -154,7 +200,7 @@ function UnifiedTable({ rows = [], allDocuments = [] }) {
                   <td className="td-name">{formatCell(row.field)}</td>
                   <td className="td-meta">
                     <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                      <span>{formatCell(row.document)}</span>
+                      <span>{formatDocLabel(row.document)}</span>
                       {matchedDoc && (
                         <button
                           type="button"
@@ -271,7 +317,9 @@ const getSolution = (item, ruleKey) => {
     if (comment.includes('format') || comment.includes('invalid format')) {
       return `Correct the format of "${field}"${doc ? ` in ${doc}` : ''}. Ensure it follows the required format (e.g. date as YYYY-MM-DD, valid NIC pattern).`;
     }
-    if (comment.includes('nic') || comment.includes('national id')) {
+    const fieldLower = String(field).toLowerCase();
+    const isNicField = fieldLower.includes('nic') || fieldLower.includes('national id') || fieldLower.includes('passport') || fieldLower.includes('id number');
+    if (isNicField && (comment.includes('nic') || comment.includes('national id') || comment.includes('format') || comment.includes('invalid'))) {
       return `Verify the NIC number in "${doc || 'the document'}" — it may be incorrectly formatted or invalid.`;
     }
     return `Review "${field}"${doc ? ` in ${doc}` : ''} — it failed a validity check. Correct the value and re-upload the document if needed.`;
@@ -341,14 +389,102 @@ const getRuleItems = (check, report) => {
   return [];
 };
 
-function RuleCheckItem({ check, report, allDocuments = [] }) {
+function RuleCheckRow({ row, checkName, ruleKey, override, mid, allDocuments, onViewDoc, onSave, onRemove }) {
+  const [showInput, setShowInput] = useState(false);
+  const [draft, setDraft] = useState('');
+  const [saving, setSaving] = useState(false);
+  const matchedDoc = findDocByLabel(row.document, allDocuments);
+
+  const handleSave = async () => {
+    if (!draft.trim() || saving) return;
+    setSaving(true);
+    await onSave({ rule_check_name: checkName, field_name: row.field || '', document_source: row.document || '—', comment: draft.trim() });
+    setSaving(false);
+    setShowInput(false);
+    setDraft('');
+  };
+
+  const handleKeyDown = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSave(); }
+    if (e.key === 'Escape') { setShowInput(false); setDraft(''); }
+  };
+
+  const isOverridden = !!override;
+
+  return (
+    <tr className={isOverridden ? 'rule-row-overridden' : ''}>
+      <td className="td-name">{formatCell(row.field)}</td>
+      <td className="td-meta">
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span>{formatDocLabel(row.document)}</span>
+          {matchedDoc && (
+            <button type="button" className="btn-doc-open" onClick={() => onViewDoc(matchedDoc)}
+              title={`Open ${matchedDoc.label || row.document}`}>View</button>
+          )}
+        </div>
+      </td>
+      <td className="td-value">{formatCell(row.aiValue)}</td>
+      <td className="td-value">{formatCell(row.apiValue)}</td>
+      <td><ExpandableComment text={formatCell(row.comment)} /></td>
+      <td className="rule-solution-cell" style={isOverridden ? { color: 'var(--ash)', fontStyle: 'italic' } : {}}>
+        {getSolution(row, ruleKey)}
+      </td>
+      {mid && (
+        <td className="rule-action-cell">
+          {isOverridden ? (
+            <div className="rule-override-confirmed">
+              <span className="rule-override-badge">✓ Ignored</span>
+              {override.comment && <span className="rule-override-note">{override.comment}</span>}
+              <button type="button" className="rule-override-remove-btn" onClick={() => onRemove(override.id)}>Undo</button>
+            </div>
+          ) : showInput ? (
+            <div className="rule-override-input-wrap">
+              <input
+                className="rule-override-comment-input"
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder="Reason for ignoring… (Enter to save)"
+                autoFocus
+              />
+              <div className="rule-override-input-actions">
+                <button type="button" className="rule-override-confirm-btn" onClick={handleSave} disabled={!draft.trim() || saving}>
+                  {saving ? '…' : 'Save'}
+                </button>
+                <button type="button" className="rule-override-cancel-btn" onClick={() => { setShowInput(false); setDraft(''); }}>
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : (
+            <button type="button" className="rule-override-btn" onClick={() => setShowInput(true)}>
+              Ignore
+            </button>
+          )}
+        </td>
+      )}
+    </tr>
+  );
+}
+
+function RuleCheckItem({ check, report, allDocuments = [], mid, overrides = [], onSaveOverride, onDeleteOverride }) {
   const [expanded, setExpanded] = useState(false);
   const [viewerDoc, setViewerDoc] = useState(null);
   const items = getRuleItems(check, report);
   const hasItems = items.length > 0;
+  const ruleKey = RULE_STATUS_MAP[check.name];
+
+  const findOverride = (item) => overrides.find((ov) =>
+    ov.rule_check_name === check.name &&
+    ov.field_name === (item.field || '') &&
+    ov.document_source === (item.document || '—')
+  ) || null;
+
+  const allOverridden = hasItems && !check.isVerdict && items.every((item) => !!findOverride(item));
+  const effectiveStatus = allOverridden ? 'pass' : check.status;
 
   return (
-    <div className={`verification-rule-row rule-row--expandable${expanded ? ' rule-row--open' : ''}`}>
+    <div className={`verification-rule-row rule-row--expandable${expanded ? ' rule-row--open' : ''}${check.isVerdict ? ' rule-row--verdict' : ''}`}>
       <button
         type="button"
         className="rule-row-header"
@@ -356,16 +492,16 @@ function RuleCheckItem({ check, report, allDocuments = [] }) {
         style={{ cursor: hasItems ? 'pointer' : 'default' }}
         aria-expanded={expanded}
       >
-        <span className={`verification-rule-state verification-rule-state--${check.status}`}>
-          {check.status}
+        <span className={`verification-rule-state verification-rule-state--${effectiveStatus}${check.isVerdict ? ' verification-rule-state--verdict' : ''}`}>
+          {effectiveStatus === 'pass'
+            ? (check.isVerdict ? 'ELIGIBLE' : allOverridden ? 'overridden' : 'pass')
+            : (check.isVerdict ? 'BLOCKED' : check.status)}
         </span>
         <div className="rule-header-text">
-          <div className="verification-rule-name">{check.name}</div>
+          <div className={`verification-rule-name${check.isVerdict ? ' verification-rule-name--verdict' : ''}`}>{check.name}</div>
           <div className="verification-rule-detail">{check.detail}</div>
         </div>
-        {hasItems && (
-          <span className="rule-expand-chevron">{expanded ? '▲' : '▼'}</span>
-        )}
+        {hasItems && <span className="rule-expand-chevron">{expanded ? '▲' : '▼'}</span>}
       </button>
 
       {expanded && hasItems && (
@@ -380,38 +516,24 @@ function RuleCheckItem({ check, report, allDocuments = [] }) {
                   <th>System Value</th>
                   <th>Detail / Reason</th>
                   <th className="rule-solution-col">Solution</th>
+                  {mid && <th className="rule-action-col">Action</th>}
                 </tr>
               </thead>
               <tbody>
-                {items.map((row, i) => {
-                  const matchedDoc = findDocByLabel(row.document, allDocuments);
-                  return (
-                    <tr key={`${row.field}-${i}`}>
-                      <td className="td-name">{formatCell(row.field)}</td>
-                      <td className="td-meta">
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                          <span>{formatCell(row.document)}</span>
-                          {matchedDoc ? (
-                            <button
-                              type="button"
-                              className="btn-doc-open"
-                              onClick={() => setViewerDoc(matchedDoc)}
-                              title={`Open ${matchedDoc.label || row.document}`}
-                            >
-                              View
-                            </button>
-                          ) : null}
-                        </div>
-                      </td>
-                      <td className="td-value">{formatCell(row.aiValue)}</td>
-                      <td className="td-value">{formatCell(row.apiValue)}</td>
-                      <td><ExpandableComment text={formatCell(row.comment)} /></td>
-                      <td className="rule-solution-cell">
-                        {getSolution(row, RULE_STATUS_MAP[check.name])}
-                      </td>
-                    </tr>
-                  );
-                })}
+                {items.map((row, i) => (
+                  <RuleCheckRow
+                    key={`${row.field}-${i}`}
+                    row={row}
+                    checkName={check.name}
+                    ruleKey={ruleKey}
+                    override={findOverride(row)}
+                    mid={mid}
+                    allDocuments={allDocuments}
+                    onViewDoc={(doc) => setViewerDoc(doc)}
+                    onSave={onSaveOverride}
+                    onRemove={onDeleteOverride}
+                  />
+                ))}
               </tbody>
             </table>
           </div>
@@ -423,7 +545,114 @@ function RuleCheckItem({ check, report, allDocuments = [] }) {
   );
 }
 
-function RuleChecks({ checks = [], report, allDocuments = [] }) {
+function DocumentChecksTable({ checks = [], overrides = [] }) {
+  if (!checks.length) return null;
+
+  const getEffectiveIssues = (check) =>
+    check.issues.filter(
+      (issue) => !overrides.some(
+        (ov) => ov.field_name === (issue.field || '') && ov.document_source === check.name
+      )
+    );
+
+  const validCount   = checks.filter((c) => c.present && getEffectiveIssues(c).length === 0).length;
+  const issueCount   = checks.filter((c) => c.present && getEffectiveIssues(c).length > 0).length;
+  const missingCount = checks.filter((c) => !c.present).length;
+
+  return (
+    <div className="card">
+      <div className="card-header">
+        <span className="card-title">
+          <span className="card-title-accent" />
+          Document Validity
+        </span>
+        <span className="card-badge">{checks.length} required</span>
+      </div>
+
+      <div className="unified-filter-bar" style={{ gap: 8, flexWrap: 'wrap' }}>
+        <span className="unified-status-badge unified-status-badge--success" style={{ fontSize: 12 }}>
+          ✓ {validCount} valid
+        </span>
+        {issueCount > 0 && (
+          <span className="unified-status-badge unified-status-badge--invalid" style={{ fontSize: 12 }}>
+            ⚠ {issueCount} has issues
+          </span>
+        )}
+        {missingCount > 0 && (
+          <span className="unified-status-badge unified-status-badge--danger" style={{ fontSize: 12 }}>
+            ✗ {missingCount} missing
+          </span>
+        )}
+      </div>
+
+      <div className="table-wrapper">
+        <table className="data-table">
+          <thead>
+            <tr>
+              <th>Document</th>
+              <th style={{ width: 100 }}>Required</th>
+              <th style={{ width: 90 }}>Present</th>
+              <th style={{ width: 90 }}>Valid</th>
+              <th>Issues</th>
+            </tr>
+          </thead>
+          <tbody>
+            {checks.map((check) => {
+              const effectiveIssues = getEffectiveIssues(check);
+              const effectiveValid = check.present && effectiveIssues.length === 0;
+              const rowClass = !check.present
+                ? 'unified-row--danger'
+                : !effectiveValid
+                  ? 'unified-row--warn'
+                  : 'unified-row--success';
+              return (
+                <tr key={check.name} className={`unified-row ${rowClass}`}>
+                  <td className="td-name">{check.name}</td>
+                  <td>
+                    <span className={`unified-status-badge ${check.isMandatory ? 'unified-status-badge--danger' : 'unified-status-badge--sys'}`}>
+                      {check.isMandatory ? 'Mandatory' : 'Optional'}
+                    </span>
+                  </td>
+                  <td>
+                    {check.present
+                      ? <span className="unified-status-badge unified-status-badge--success">✓ Present</span>
+                      : <span className="unified-status-badge unified-status-badge--danger">✗ Missing</span>
+                    }
+                  </td>
+                  <td>
+                    {!check.present
+                      ? <span style={{ color: 'var(--ash)' }}>—</span>
+                      : effectiveValid
+                        ? <span className="unified-status-badge unified-status-badge--success">✓ Valid</span>
+                        : <span className="unified-status-badge unified-status-badge--invalid">✗ Invalid</span>
+                    }
+                  </td>
+                  <td className="td-value">
+                    {effectiveIssues.length === 0
+                      ? <span style={{ color: 'var(--ash)' }}>—</span>
+                      : (
+                        <ul style={{ margin: 0, paddingLeft: 16, fontSize: 12, lineHeight: 1.6 }}>
+                          {effectiveIssues.map((issue, i) => (
+                            <li key={i}>
+                              {issue.field && <strong>{issue.field}: </strong>}
+                              {issue.reason}
+                            </li>
+                          ))}
+                        </ul>
+                      )
+                    }
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function RuleChecks({ checks = [], report, allDocuments = [], mid, overrides = [], onSaveOverride, onDeleteOverride }) {
   if (!checks.length) return null;
 
   return (
@@ -437,16 +666,62 @@ function RuleChecks({ checks = [], report, allDocuments = [] }) {
       </div>
       <div className="verification-rule-list">
         {checks.map((check) => (
-          <RuleCheckItem key={check.name} check={check} report={report} allDocuments={allDocuments} />
+          <RuleCheckItem
+            key={check.name}
+            check={check}
+            report={report}
+            allDocuments={allDocuments}
+            mid={mid}
+            overrides={overrides}
+            onSaveOverride={onSaveOverride}
+            onDeleteOverride={onDeleteOverride}
+          />
         ))}
       </div>
     </div>
   );
 }
 
-function VerificationSummary({ report }) {
+function AiInsightCard({ insight }) {
+  return (
+    <div className="ai-insight-card">
+      <div className="ai-insight-header">
+        <span className="ai-insight-icon">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="12" cy="12" r="10"/>
+            <line x1="12" y1="8" x2="12" y2="12"/>
+            <line x1="12" y1="16" x2="12.01" y2="16"/>
+          </svg>
+        </span>
+        <span className="ai-insight-title">AI Analysis</span>
+        <span className="ai-insight-badge">Google AI</span>
+      </div>
+      <p className="ai-insight-body">{parseBold(insight)}</p>
+    </div>
+  );
+}
+
+function VerificationSummary({ report, overrides = [] }) {
   if (!report) return null;
   const summary = report.summary || {};
+  const rows = report.unifiedRows || [];
+
+  const failureStatuses = new Set(['missing', 'mismatch', 'invalid']);
+  let matched = summary.matchedFields || 0;
+  let missing = summary.missingData || 0;
+  let invalid = summary.invalidData || 0;
+  let mismatches = summary.mismatches || 0;
+  rows.forEach((row) => {
+    if (!failureStatuses.has(row.status)) return;
+    const isOverridden = overrides.some(
+      (ov) => ov.field_name === (row.field || '') && ov.document_source === (row.document || '—')
+    );
+    if (!isOverridden) return;
+    if (row.status === 'missing')  missing   = Math.max(0, missing   - 1);
+    if (row.status === 'mismatch') mismatches = Math.max(0, mismatches - 1);
+    if (row.status === 'invalid')  invalid   = Math.max(0, invalid   - 1);
+    matched += 1;
+  });
 
   return (
     <div className="card">
@@ -459,10 +734,10 @@ function VerificationSummary({ report }) {
       </div>
       <div className="verification-summary">
         <SummaryMetric label="Documents read" value={summary.receivedDocuments || 0} />
-        <SummaryMetric label="Matched fields" value={summary.matchedFields || 0} tone="success" />
-        <SummaryMetric label="Missing data" value={summary.missingData || 0} tone="danger" />
-        <SummaryMetric label="Invalid data" value={summary.invalidData || 0} tone="danger" />
-        <SummaryMetric label="Mismatches" value={summary.mismatches || 0} tone="danger" />
+        <SummaryMetric label="Matched fields" value={matched} tone="success" />
+        <SummaryMetric label="Missing data" value={missing} tone="danger" />
+        <SummaryMetric label="Invalid data" value={invalid} tone="danger" />
+        <SummaryMetric label="Mismatches" value={mismatches} tone="danger" />
         <SummaryMetric label="AI-Onboarding-V2" value={summary.documentOnlyData || 0} tone="warning" />
         <SummaryMetric label="System Data" value={summary.systemOnlyData || 0} tone="warning" />
       </div>
@@ -470,7 +745,53 @@ function VerificationSummary({ report }) {
   );
 }
 
-function MerchantTable({ merchants, onSelect }) {
+const DASH_CARDS = [
+  { key: null,        label: 'Total Merchants',  tone: 'neutral',  icon: '▤' },
+  { key: 'analyzed',  label: 'Analyzed',         tone: 'success',  icon: '✓' },
+  { key: 'remaining', label: 'Remaining',        tone: 'warn',     icon: '⏳' },
+  { key: 'above50',   label: 'Score ≥ 50%',      tone: 'success',  icon: '↑' },
+  { key: 'below50',   label: 'Score < 50%',      tone: 'danger',   icon: '↓' },
+];
+
+function DashboardStats({ stats, meta, activeFilter, onFilter }) {
+  const webxpayTotal = meta?.total ?? null;
+
+  const getValue = (key) => {
+    if (key === null) return webxpayTotal;
+    if (key === 'remaining') {
+      // Remaining = WebXPay total − analyzed (more accurate than local-DB remaining)
+      return webxpayTotal != null && stats?.analyzed != null
+        ? Math.max(0, webxpayTotal - stats.analyzed)
+        : stats?.remaining ?? null;
+    }
+    return stats?.[key] ?? null;
+  };
+
+  return (
+    <div className="ma-dashboard">
+      {DASH_CARDS.map((card) => {
+        const val = getValue(card.key);
+        const isActive = activeFilter === card.key;
+        return (
+          <button
+            key={card.key ?? 'all'}
+            type="button"
+            className={`ma-stat-card ma-stat-card--${card.tone}${isActive ? ' ma-stat-card--active' : ''}`}
+            onClick={() => onFilter(card.key)}
+          >
+            <span className="ma-stat-icon">{card.icon}</span>
+            <span className="ma-stat-value">{val != null ? val.toLocaleString() : '—'}</span>
+            <span className="ma-stat-label">{card.label}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function MerchantTable({ merchants, loading, meta, page, onPageChange, onSelect }) {
+  const totalPages = meta ? meta.last_page : 1;
+
   return (
     <div className="card">
       <div className="card-header">
@@ -478,32 +799,46 @@ function MerchantTable({ merchants, onSelect }) {
           <span className="card-title-accent" />
           All Merchants
         </span>
-        <span className="card-badge">{merchants.length} merchants</span>
+        {meta && (
+          <span className="card-badge">{meta.total.toLocaleString()} merchants</span>
+        )}
       </div>
       <div className="table-wrapper ma-full-table">
         <table className="data-table">
           <thead>
             <tr>
-              <th>MID</th>
-              <th>Merchant</th>
+              <th>ID</th>
+              <th>Business Name</th>
               <th>Type</th>
               <th>Channel</th>
-              <th>Last Analysis</th>
-              <th>Status</th>
-              <th>Score</th>
+              <th style={{ width: 80, textAlign: 'center' }}>Score</th>
+              <th style={{ width: 100, textAlign: 'center' }}>Status</th>
             </tr>
           </thead>
           <tbody>
-            {merchants.length === 0 ? (
+            {loading ? (
               <tr>
-                <td colSpan={7}>
+                <td colSpan={6}>
+                  <div className="empty-state">
+                    <div className="empty-state-text">Loading merchants…</div>
+                  </div>
+                </td>
+              </tr>
+            ) : merchants.length === 0 ? (
+              <tr>
+                <td colSpan={6}>
                   <div className="empty-state">
                     <div className="empty-state-text">No merchants found.</div>
                   </div>
                 </td>
               </tr>
             ) : merchants.map((merchant) => {
-              const status = listStatus(merchant);
+              const score = merchant.satisfaction_score;
+              const scoreTone = score == null ? 'sys'
+                : score >= 70 ? 'success'
+                : score >= 40 ? 'warn'
+                : 'danger';
+              const analyzed = merchant.can_onboard != null;
               return (
                 <tr
                   key={merchant.mid}
@@ -512,33 +847,66 @@ function MerchantTable({ merchants, onSelect }) {
                 >
                   <td className="td-id">{merchant.mid}</td>
                   <td className="td-name">{merchant.merchant_business_name || '-'}</td>
-                  <td><span className="merchant-pill">{merchant.merchant_type_name || '-'}</span></td>
-                  <td>{merchant.merchant_channel || '-'}</td>
-                  <td className="td-meta">{fmtDate(merchant.latest_analysis_at)}</td>
-                  <td><span className={`status-badge ${status.className}`}>{status.label}</span></td>
-                  <td className="td-meta">{merchant.satisfaction_score ?? '-'}</td>
+                  <td className="td-meta" style={{ fontSize: 12 }}>{merchant.merchant_type_name || <span style={{ color: 'var(--ash)' }}>—</span>}</td>
+                  <td className="td-meta" style={{ fontSize: 12 }}>{merchant.merchant_channel || <span style={{ color: 'var(--ash)' }}>—</span>}</td>
+                  <td style={{ textAlign: 'center' }}>
+                    {score != null
+                      ? <span className={`unified-status-badge unified-status-badge--${scoreTone}`}>{score}%</span>
+                      : <span style={{ color: 'var(--ash)', fontSize: 12 }}>—</span>
+                    }
+                  </td>
+                  <td style={{ textAlign: 'center' }}>
+                    {!analyzed
+                      ? <span className="unified-status-badge unified-status-badge--sys" style={{ fontSize: 11 }}>Pending</span>
+                      : merchant.can_onboard
+                        ? <span className="unified-status-badge unified-status-badge--success" style={{ fontSize: 11 }}>✓ Clear</span>
+                        : <span className="unified-status-badge unified-status-badge--danger" style={{ fontSize: 11 }}>✗ Review</span>
+                    }
+                  </td>
                 </tr>
               );
             })}
           </tbody>
         </table>
       </div>
+      {totalPages > 1 && (
+        <div className="docs-pagination" style={{ borderTop: '1px solid var(--border)' }}>
+          <button
+            className="docs-page-btn"
+            disabled={page <= 1 || loading}
+            onClick={() => onPageChange(page - 1)}
+          >‹</button>
+          <span className="docs-page-info">Page {page} of {totalPages}</span>
+          <button
+            className="docs-page-btn"
+            disabled={page >= totalPages || loading}
+            onClick={() => onPageChange(page + 1)}
+          >›</button>
+        </div>
+      )}
     </div>
   );
 }
 
 export default function MerchantAnalysis() {
   const [merchants, setMerchants] = useState([]);
-  const [selectedMerchant, setSelectedMerchant] = useState(null);
+  const [merchantMeta, setMerchantMeta] = useState(null);
+  const [merchantPage, setMerchantPage] = useState(1);
   const [searchInput, setSearchInput] = useState('');
+  const [selectedMerchant, setSelectedMerchant] = useState(null);
   const [report, setReport] = useState(null);
   const [documentJson, setDocumentJson] = useState('');
   const [systemJson, setSystemJson] = useState('');
+  const [overrides, setOverrides] = useState([]);
+  const [dashStats, setDashStats] = useState(null);
+  const [activeFilter, setActiveFilter] = useState(null);
   const [loadingMerchants, setLoadingMerchants] = useState(true);
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [running, setRunning] = useState(false);
   const [autoRunning, setAutoRunning] = useState(false);
   const [message, setMessage] = useState({ text: '', type: '' });
+  const searchTimer = useRef(null);
+  const location = useLocation();
 
   const allDocuments = useMemo(() => {
     if (!systemJson) return [];
@@ -548,27 +916,40 @@ export default function MerchantAnalysis() {
     } catch { return []; }
   }, [systemJson]);
 
-  const filteredMerchants = useMemo(() => {
-    const needle = searchInput.trim().toLowerCase();
-    if (!needle) return merchants;
-    return merchants.filter((merchant) => (
-      String(merchant.mid || '').toLowerCase().includes(needle)
-      || String(merchant.merchant_business_name || '').toLowerCase().includes(needle)
-      || String(merchant.merchant_type_name || '').toLowerCase().includes(needle)
-    ));
-  }, [merchants, searchInput]);
+  const loadDashStats = useCallback(async () => {
+    try {
+      const { data } = await api.get('/onboard-verification/dashboard-stats');
+      setDashStats(data);
+    } catch { /* silent — dashboard is non-critical */ }
+  }, []);
 
-  const loadMerchants = async () => {
+  const loadMerchants = useCallback(async (query, pg, filter = '') => {
     setLoadingMerchants(true);
     try {
-      const response = await api.get('/onboard-verification/merchants');
-      setMerchants(response.data || []);
+      const params = { page: pg };
+      if (query)  params.search = query;
+      if (filter) params.filter = filter;
+      const { data } = await api.get('/onboard-verification/merchant-list', { params });
+      // Map WebXPay fields → internal shape expected by rest of the page
+      const mapped = (data.data || []).map((m) => ({
+        mid: m.id,
+        merchant_number: m.merchant_number,
+        merchant_business_name: m.doing_business_name,
+        registered_business_name: m.registered_business_name,
+        merchant_channel:   m.merchant_channel   || null,
+        merchant_type_name: m.merchant_type_name || null,
+        can_onboard:        m.can_onboard        != null ? m.can_onboard : null,
+        satisfaction_score: m.satisfaction_score != null ? m.satisfaction_score : null,
+        last_analysis_at:   m.last_analysis_at   || null,
+      }));
+      setMerchants(mapped);
+      setMerchantMeta(data.meta || null);
     } catch (err) {
       setMessage({ text: err.response?.data?.message || 'Failed to load merchants.', type: 'error' });
     } finally {
       setLoadingMerchants(false);
     }
-  };
+  }, []);
 
   const loadMerchantDetail = async (merchant) => {
     if (!merchant?.mid) return;
@@ -582,12 +963,13 @@ export default function MerchantAnalysis() {
     // Always fetch DB merchant info so type/channel/name are populated even on direct MID search
     const needsDbInfo = !merchant.merchant_type_name || !merchant.merchant_channel;
 
-    const [analysisResult, systemResult, merchantInfoResult] = await Promise.allSettled([
+    const [analysisResult, systemResult, merchantInfoResult, overridesResult] = await Promise.allSettled([
       api.get(`/onboard-verification/latest-analysis/${encodeURIComponent(merchant.mid)}`),
       api.get(`/onboard-verification/external-merchant/${encodeURIComponent(merchant.mid)}`),
       needsDbInfo
         ? api.get(`/onboard-verification/merchant/${encodeURIComponent(merchant.mid)}`)
         : Promise.resolve(null),
+      api.get(`/onboard-verification/rule-overrides/${encodeURIComponent(merchant.mid)}`),
     ]);
 
     // Populate type/channel from DB
@@ -637,23 +1019,34 @@ export default function MerchantAnalysis() {
       }));
     }
 
+    setOverrides(
+      overridesResult.status === 'fulfilled' && Array.isArray(overridesResult.value.data)
+        ? overridesResult.value.data
+        : []
+    );
+
     setLoadingDetail(false);
   };
 
-  const handleSearch = () => {
-    const needle = searchInput.trim();
-    if (!needle) {
-      // Empty search: refresh and show all merchants
-      loadMerchants();
-      return;
-    }
-    const exact = merchants.find((m) => String(m.mid).toLowerCase() === needle.toLowerCase());
-    if (exact) {
-      loadMerchantDetail(exact);
-    } else {
-      // MID not in local list — try loading directly from API
-      loadMerchantDetail({ mid: needle });
-    }
+  const handleFilterClick = (filterKey) => {
+    const next = activeFilter === filterKey ? null : filterKey;
+    setActiveFilter(next);
+    setMerchantPage(1);
+    setSearchInput('');
+    loadMerchants('', 1, next || '');
+  };
+
+  const handleSearchChange = (e) => {
+    const q = e.target.value;
+    setSearchInput(q);
+    setMerchantPage(1);
+    clearTimeout(searchTimer.current);
+    searchTimer.current = setTimeout(() => loadMerchants(q, 1, activeFilter || ''), 400);
+  };
+
+  const handlePageChange = (pg) => {
+    setMerchantPage(pg);
+    loadMerchants(searchInput, pg, activeFilter || '');
   };
 
   const handleBack = () => {
@@ -661,8 +1054,8 @@ export default function MerchantAnalysis() {
     setReport(null);
     setDocumentJson('');
     setSystemJson('');
+    setOverrides([]);
     setMessage({ text: '', type: '' });
-    loadMerchants(); // Refresh list on return
   };
 
   const runAnalysis = async (forceReExtract = false) => {
@@ -701,13 +1094,20 @@ export default function MerchantAnalysis() {
           )
           : prev?.satisfaction_score,
       }));
+      try {
+        const { data: ov } = await api.get(`/onboard-verification/rule-overrides/${encodeURIComponent(selectedMerchant.mid)}`);
+        setOverrides(Array.isArray(ov) ? ov : []);
+      } catch { setOverrides([]); }
+      loadDashStats();
       const modeNote = response.data.usedCachedExtraction
         ? 'Cached document extraction used — results are consistent.'
         : 'Fresh AI extraction completed.';
       setMessage({ text: `Verification complete. ${modeNote}`, type: 'success' });
-      await loadMerchants();
+      // no need to reload the list after analysis
     } catch (err) {
-      setMessage({ text: err.response?.data?.message || 'Analysis failed.', type: 'error' });
+      const serverMsg = err.response?.data?.message;
+      const httpStatus = err.response?.status ? ` (HTTP ${err.response.status})` : '';
+      setMessage({ text: serverMsg || `Analysis failed${httpStatus}. Check server logs for details.`, type: 'error' });
     } finally {
       setRunning(false);
     }
@@ -715,19 +1115,15 @@ export default function MerchantAnalysis() {
 
   const triggerAutoRun = async () => {
     setAutoRunning(true);
-    setMessage({ text: 'Triggering auto-analysis for newly onboarded merchants...', type: '' });
+    setMessage({ text: 'Triggering auto-analysis for unanalyzed merchants...', type: '' });
     try {
       const response = await api.post('/onboard-verification/auto-run');
-      const { ran, succeeded, failed, skipped } = response.data;
-      if (skipped) {
-        setMessage({ text: 'Auto-run is already in progress.', type: '' });
-      } else {
-        setMessage({
-          text: `Auto-run complete: ${ran} merchant(s) processed — ${succeeded} succeeded, ${failed} failed.`,
-          type: failed > 0 ? 'error' : 'success',
-        });
-        await loadMerchants();
-      }
+      const { message: serverMsg, running } = response.data;
+      setMessage({
+        text: serverMsg || (running ? 'Auto-run started in background.' : 'Done.'),
+        type: 'success',
+      });
+      loadDashStats();
     } catch (err) {
       setMessage({ text: err.response?.data?.message || 'Auto-run failed.', type: 'error' });
     } finally {
@@ -735,9 +1131,33 @@ export default function MerchantAnalysis() {
     }
   };
 
+  const handleSaveOverride = useCallback(async (overrideData) => {
+    if (!selectedMerchant?.mid) return;
+    try {
+      const { data } = await api.post('/onboard-verification/rule-overrides', {
+        mid: selectedMerchant.mid,
+        ...overrideData,
+      });
+      setOverrides(Array.isArray(data) ? data : []);
+    } catch (err) {
+      setMessage({ text: err.response?.data?.message || 'Failed to save override.', type: 'error' });
+    }
+  }, [selectedMerchant]);
+
+  const handleDeleteOverride = useCallback(async (id) => {
+    if (!selectedMerchant?.mid) return;
+    try {
+      const { data } = await api.delete(`/onboard-verification/rule-overrides/${id}?mid=${encodeURIComponent(selectedMerchant.mid)}`);
+      setOverrides(Array.isArray(data) ? data : []);
+    } catch (err) {
+      setMessage({ text: err.response?.data?.message || 'Failed to remove override.', type: 'error' });
+    }
+  }, [selectedMerchant]);
+
   useEffect(() => {
-    loadMerchants();
-  }, []);
+    loadMerchants('', 1);
+    loadDashStats();
+  }, [loadMerchants, loadDashStats, location]);
 
   return (
     <PageLayout>
@@ -748,33 +1168,34 @@ export default function MerchantAnalysis() {
 
       {/* Search bar */}
       <div className="ma-search-bar">
-        <input
-          className="form-control"
-          value={searchInput}
-          onChange={(e) => setSearchInput(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
-          placeholder="Enter MID to search..."
-        />
-        <button
-          className="btn btn-primary"
-          type="button"
-          onClick={handleSearch}
-          disabled={loadingDetail || loadingMerchants}
-        >
-          Search
-        </button>
+        {!selectedMerchant && (
+          <div className="vi-input-group" style={{ flex: 1 }}>
+            <span className="vi-input-icon">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+              </svg>
+            </span>
+            <input
+              className="form-control vi-input-has-icon"
+              value={searchInput}
+              onChange={handleSearchChange}
+              placeholder="Search merchants by name…"
+              disabled={loadingMerchants}
+            />
+          </div>
+        )}
         {selectedMerchant && (
           <button className="btn btn-secondary" type="button" onClick={handleBack}>
-            Back to List
+            ← Back to List
           </button>
         )}
         <button
           className="btn btn-secondary"
           type="button"
-          onClick={loadMerchants}
+          onClick={() => { loadMerchants(searchInput, merchantPage, activeFilter || ''); loadDashStats(); }}
           disabled={loadingMerchants}
         >
-          {loadingMerchants ? 'Loading...' : 'Refresh'}
+          {loadingMerchants ? 'Loading…' : 'Refresh'}
         </button>
         <button
           className="btn btn-secondary"
@@ -783,7 +1204,7 @@ export default function MerchantAnalysis() {
           disabled={autoRunning}
           title="Run analysis for newly onboarded merchants today"
         >
-          {autoRunning ? 'Running...' : 'Auto-Run'}
+          {autoRunning ? 'Running…' : 'Auto-Run'}
         </button>
       </div>
 
@@ -793,12 +1214,24 @@ export default function MerchantAnalysis() {
         </div>
       )}
 
-      {/* Table view — shown when no merchant is selected */}
+      {/* Dashboard + table view — shown when no merchant is selected */}
       {!selectedMerchant && (
-        <MerchantTable
-          merchants={filteredMerchants}
-          onSelect={loadMerchantDetail}
-        />
+        <>
+          <DashboardStats
+            stats={dashStats}
+            meta={merchantMeta}
+            activeFilter={activeFilter}
+            onFilter={handleFilterClick}
+          />
+          <MerchantTable
+            merchants={merchants}
+            loading={loadingMerchants}
+            meta={merchantMeta}
+            page={merchantPage}
+            onPageChange={handlePageChange}
+            onSelect={loadMerchantDetail}
+          />
+        </>
       )}
 
       {/* Detail view — shown when a merchant is selected */}
@@ -861,9 +1294,26 @@ export default function MerchantAnalysis() {
 
           {report && (
             <>
-              <VerificationSummary report={report} />
-              <RuleChecks checks={report.ruleChecks} report={report} allDocuments={allDocuments} />
-              <UnifiedTable rows={report.unifiedRows || []} allDocuments={allDocuments} />
+              <VerificationSummary report={report} overrides={overrides} />
+              <RuleChecks
+                checks={report.ruleChecks}
+                report={report}
+                allDocuments={allDocuments}
+                mid={selectedMerchant.mid}
+                overrides={overrides}
+                onSaveOverride={handleSaveOverride}
+                onDeleteOverride={handleDeleteOverride}
+              />
+              <UnifiedTable
+                rows={(report.unifiedRows || []).filter((row) => {
+                  if (!['missing', 'mismatch', 'invalid'].includes(row.status)) return true;
+                  return !overrides.some(
+                    (ov) => ov.field_name === (row.field || '') && ov.document_source === (row.document || '—')
+                  );
+                })}
+                allDocuments={allDocuments}
+              />
+              <DocumentChecksTable checks={report.documentChecks || []} overrides={overrides} />
             </>
           )}
 

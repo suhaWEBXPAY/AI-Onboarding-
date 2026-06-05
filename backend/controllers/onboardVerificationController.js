@@ -2,8 +2,8 @@ const db = require('../config/db');
 const path = require('path');
 const fs = require('fs');
 const fetch = require('node-fetch');
-const { buildVerificationReport } = require('../services/verificationEngine');
-const { analyzeDocuments } = require('../services/documentAnalyzer');
+const { buildVerificationReport, patchReportCompatibleMismatches } = require('../services/verificationEngine');
+const { analyzeDocuments, verifyCrossDocumentMismatches } = require('../services/documentAnalyzer');
 const { getUsage, getRemainingBudget } = require('../services/costTracker');
 
 const UPLOADS_ROOT = path.join(__dirname, '..');
@@ -282,6 +282,20 @@ const normalizeSystemDataForVerification = (systemData) => {
         if (doc.source) uploadedDocNames.push(doc.source);
         const label = doc.label || (doc.document_name ? doc.document_name.replace(/_/g, ' ') : null);
         if (label) apiDocLabels.push(label);
+        // Stakeholder ID documents: labels like "ID Copy (Director Front)" don't token-match
+        // requirements like "NIC / Passport / DL" because "director"/"front" pollute the token set.
+        // Add generic identity keywords so the requirement presence check passes.
+        if (String(doc.source || '').toLowerCase() === 'stakeholder') {
+          const labelLower = String(label || '').toLowerCase();
+          if (labelLower.includes('id') || labelLower.includes('nic') || labelLower.includes('identity')) {
+            uploadedDocNames.push('national identity card');
+            uploadedDocNames.push('nic');
+          }
+          if (labelLower.includes('passport')) uploadedDocNames.push('passport');
+          if (labelLower.includes('driving') || labelLower.includes(' dl') || labelLower.includes('license') || labelLower.includes('licence')) {
+            uploadedDocNames.push('driving licence');
+          }
+        }
       });
     }
 
@@ -330,18 +344,29 @@ const fetchWebxpayApprovalView = async (mid) => {
     throw err;
   }
 
-  const response = await fetch(
-    `https://signup.webxpay.com/api/merchant-manager/approval-view/${encodeURIComponent(mid)}`,
-    {
-      method: 'GET',
-      headers: {
-        Accept: 'application/json',
-        Authorization: `Bearer ${token}`,
-        Cookie: cookie,
-      },
-      redirect: 'follow',
+  let response;
+  try {
+    response = await fetch(
+      `https://signup.webxpay.com/api/merchant-manager/approval-view/${encodeURIComponent(mid)}`,
+      {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+          Authorization: `Bearer ${token}`,
+          Cookie: cookie,
+        },
+        redirect: 'follow',
+        timeout: 30000,
+      }
+    );
+  } catch (fetchErr) {
+    if (fetchErr.type === 'request-timeout') {
+      const err = new Error('WebXPay API request timed out. Please try again.');
+      err.statusCode = 504;
+      throw err;
     }
-  );
+    throw fetchErr;
+  }
 
   const text = await response.text();
   let data;
@@ -454,20 +479,33 @@ const resolveMerchantContext = async (mid, webxpayData, merchantTypeIdFromReques
 const saveVerificationSnapshot = async ({ mid, merchantTypeName, documentData, report }) => {
   const canOnboard = report.status === 'verified' ? 1 : 0;
   const satisfactionScore = computeSatisfactionScore(report.summary);
+  const extractedJson = JSON.stringify(documentData);
+  const validationJson = JSON.stringify(report);
 
-  await db.query(
-    `INSERT INTO merchant_document_json_data
-       (mid, merchant_document_id, document_type, uploaded_file_path, extracted_json, validation_json, can_onboard, satisfaction_score)
-     VALUES (?, NULL, ?, NULL, ?, ?, ?, ?)`,
-    [
-      mid || null,
-      merchantTypeName,
-      JSON.stringify(documentData),
-      JSON.stringify(report),
-      canOnboard,
-      satisfactionScore,
-    ]
-  ).catch((err) => console.error('merchant_document_json_data insert error:', err));
+  try {
+    const [existing] = await db.query(
+      `SELECT id FROM merchant_document_json_data WHERE mid = ? ORDER BY created_at DESC LIMIT 1`,
+      [mid || null]
+    );
+
+    if (existing.length > 0) {
+      await db.query(
+        `UPDATE merchant_document_json_data
+         SET document_type = ?, extracted_json = ?, validation_json = ?, can_onboard = ?, satisfaction_score = ?
+         WHERE id = ?`,
+        [merchantTypeName, extractedJson, validationJson, canOnboard, satisfactionScore, existing[0].id]
+      );
+    } else {
+      await db.query(
+        `INSERT INTO merchant_document_json_data
+           (mid, merchant_document_id, document_type, uploaded_file_path, extracted_json, validation_json, can_onboard, satisfaction_score)
+         VALUES (?, NULL, ?, NULL, ?, ?, ?, ?)`,
+        [mid || null, merchantTypeName, extractedJson, validationJson, canOnboard, satisfactionScore]
+      );
+    }
+  } catch (err) {
+    console.error('merchant_document_json_data upsert error:', err);
+  }
 };
 
 const runDataVerification = async (req, res) => {
@@ -501,7 +539,7 @@ const runDataVerification = async (req, res) => {
 
     const { normalizedSystemData, uploadedDocNames, apiDocLabels } = normalizeSystemDataForVerification(systemData);
 
-    const report = buildVerificationReport({
+    let report = buildVerificationReport({
       mid,
       merchantType: merchantTypes[0],
       merchantChannel: merchant_channel || merchantChannel,
@@ -511,6 +549,12 @@ const runDataVerification = async (req, res) => {
       uploadedDocNames,
       apiDocLabels,
     });
+
+    const crossDocMismatches = (report.mismatches || []).filter((m) => m.category === 'ai_cross_document_mismatch');
+    if (crossDocMismatches.length > 0) {
+      const compatible = await verifyCrossDocumentMismatches(crossDocMismatches).catch(() => new Set());
+      if (compatible.size > 0) report = patchReportCompatibleMismatches(report, compatible);
+    }
 
     await saveVerificationSnapshot({
       mid,
@@ -522,7 +566,7 @@ const runDataVerification = async (req, res) => {
     return res.json(report);
   } catch (err) {
     console.error('runDataVerification error:', err);
-    return res.status(500).json({ message: 'Server error.' });
+    return res.status(err.statusCode || 500).json({ message: err.message || 'Server error.' });
   }
 };
 
@@ -589,6 +633,7 @@ const runAiAnalysis = async (req, res) => {
           Cookie: process.env.WEBXPAY_COOKIE,
         },
         redirect: 'follow',
+        timeout: 30000,
       }
     );
 
@@ -684,12 +729,25 @@ const runAiAnalysis = async (req, res) => {
 
     if (merchantTypeId) {
       try {
-        await db.query(
-          `INSERT INTO merchant_document_json_data
-             (mid, merchant_document_id, document_type, uploaded_file_path, extracted_json, validation_json, can_onboard, satisfaction_score)
-           VALUES (?, NULL, ?, NULL, ?, NULL, ?, ?)`,
-          [mid, merchantTypeName, JSON.stringify(result), canOnboard, satisfactionScore]
+        const [existing] = await db.query(
+          `SELECT id FROM merchant_document_json_data WHERE mid = ? ORDER BY created_at DESC LIMIT 1`,
+          [mid]
         );
+        if (existing.length > 0) {
+          await db.query(
+            `UPDATE merchant_document_json_data
+             SET document_type = ?, extracted_json = ?, can_onboard = ?, satisfaction_score = ?
+             WHERE id = ?`,
+            [merchantTypeName, JSON.stringify(result), canOnboard, satisfactionScore, existing[0].id]
+          );
+        } else {
+          await db.query(
+            `INSERT INTO merchant_document_json_data
+               (mid, merchant_document_id, document_type, uploaded_file_path, extracted_json, validation_json, can_onboard, satisfaction_score)
+             VALUES (?, NULL, ?, NULL, ?, NULL, ?, ?)`,
+            [mid, merchantTypeName, JSON.stringify(result), canOnboard, satisfactionScore]
+          );
+        }
       } catch (dbErr) {
         console.error('[runAiAnalysis] Could not save to merchant_document_json_data:', dbErr.message);
       }
@@ -776,7 +834,7 @@ const runFullAnalysisForMid = async (mid, options = {}) => {
 
   const { normalizedSystemData, uploadedDocNames, apiDocLabels } = normalizeSystemDataForVerification(systemData);
 
-  const report = buildVerificationReport({
+  let report = buildVerificationReport({
     mid,
     merchantType: merchantContext.merchantType,
     merchantChannel: merchant_channel || merchantChannel || 'IPG',
@@ -786,6 +844,15 @@ const runFullAnalysisForMid = async (mid, options = {}) => {
     uploadedDocNames,
     apiDocLabels,
   });
+
+  const crossDocMismatches = (report.mismatches || []).filter((m) => m.category === 'ai_cross_document_mismatch');
+  if (crossDocMismatches.length > 0) {
+    const compatible = await verifyCrossDocumentMismatches(crossDocMismatches).catch(() => new Set());
+    if (compatible.size > 0) {
+      report = patchReportCompatibleMismatches(report, compatible);
+      console.log(`[runFullAnalysisForMid] Resolved ${compatible.size} semantically compatible cross-doc mismatch(es) for MID: ${mid}`);
+    }
+  }
 
   await saveVerificationSnapshot({
     mid,
@@ -817,15 +884,18 @@ const runFullApiVerification = async (req, res) => {
   }
 };
 
-const triggerAutoRun = async (req, res) => {
-  const { runAutoAnalysis } = require('../services/autoRunService');
-  try {
-    const result = await runAutoAnalysis(runFullAnalysisForMid);
-    return res.json(result);
-  } catch (err) {
-    console.error('triggerAutoRun error:', err);
-    return res.status(500).json({ message: err.message || 'Auto-run failed.' });
+const triggerAutoRun = (req, res) => {
+  const { runAutoAnalysis, getAutoRunStatus } = require('../services/autoRunService');
+  const status = getAutoRunStatus();
+  if (status.running) {
+    return res.json({ message: 'Auto-run already in progress.', ...status });
   }
+  // Fire and forget — do not await. Analysis of many merchants can take 30+ minutes
+  // and would exceed the HTTP proxy timeout if awaited.
+  runAutoAnalysis(runFullAnalysisForMid).catch((err) => {
+    console.error('triggerAutoRun background error:', err.message);
+  });
+  return res.json({ message: 'Auto-run started in background. Check status endpoint for progress.', running: true });
 };
 
 const getAutoRunStatusHandler = (req, res) => {
@@ -835,7 +905,7 @@ const getAutoRunStatusHandler = (req, res) => {
 
 const getAiUsage = (req, res) => {
   const usage = getUsage();
-  const budgetUsd = Number(process.env.AI_BUDGET_USD || 0.50);
+  const budgetUsd = Number(process.env.AI_BUDGET_USD || 5.00);
   return res.json({
     total_cost_usd:      Number(usage.total_cost_usd.toFixed(5)),
     budget_usd:          budgetUsd,
@@ -847,6 +917,309 @@ const getAiUsage = (req, res) => {
   });
 };
 
+const fetchMerchantList = async (req, res) => {
+  const page   = parseInt(req.query.page, 10) || 1;
+  const search = req.query.search ? req.query.search.trim() : '';
+  const filter = req.query.filter || '';
+
+  const VALID_FILTERS = ['analyzed', 'remaining', 'above50', 'below50'];
+  if (filter && VALID_FILTERS.includes(filter)) {
+    try {
+      const perPage = 15;
+      const offset  = (page - 1) * perPage;
+
+      let joinType   = 'LEFT JOIN';
+      let whereExtra = '';
+      if (filter === 'analyzed')  { whereExtra = 'AND mdjd.can_onboard IS NOT NULL'; }
+      if (filter === 'remaining') { whereExtra = 'AND (mdjd.mid IS NULL OR mdjd.can_onboard IS NULL)'; }
+      if (filter === 'above50')   { joinType = 'INNER JOIN'; whereExtra = 'AND mdjd.satisfaction_score >= 50'; }
+      if (filter === 'below50')   { joinType = 'INNER JOIN'; whereExtra = 'AND mdjd.satisfaction_score IS NOT NULL AND mdjd.satisfaction_score < 50'; }
+
+      const searchClause = search ? 'AND (mi.mid LIKE ? OR mi.merchant_business_name LIKE ?)' : '';
+      const searchParams = search ? [`%${search}%`, `%${search}%`] : [];
+
+      const [[{ total }]] = await db.query(
+        `SELECT COUNT(*) AS total
+         FROM merchant_information mi
+         ${joinType} merchant_document_json_data mdjd ON mdjd.mid = mi.mid
+         LEFT JOIN merchant_types mt ON mt.id = mi.merchant_type_id
+         WHERE 1=1 ${whereExtra} ${searchClause}`,
+        [...searchParams]
+      );
+
+      const [rows] = await db.query(
+        `SELECT
+           mi.mid                        AS id,
+           mi.merchant_business_name     AS doing_business_name,
+           mi.merchant_business_name     AS registered_business_name,
+           mi.merchant_channel,
+           mt.name                       AS merchant_type_name,
+           mdjd.can_onboard,
+           mdjd.satisfaction_score,
+           mdjd.updated_at               AS last_analysis_at
+         FROM merchant_information mi
+         ${joinType} merchant_document_json_data mdjd ON mdjd.mid = mi.mid
+         LEFT JOIN merchant_types mt ON mt.id = mi.merchant_type_id
+         WHERE 1=1 ${whereExtra} ${searchClause}
+         ORDER BY mdjd.updated_at DESC, mi.mid ASC
+         LIMIT ? OFFSET ?`,
+        [...searchParams, perPage, offset]
+      );
+
+      return res.json({
+        data: rows,
+        meta: {
+          total,
+          per_page:      perPage,
+          current_page:  page,
+          last_page:     Math.max(1, Math.ceil(total / perPage)),
+        },
+      });
+    } catch (err) {
+      console.error('fetchMerchantList (filtered) error:', err);
+      return res.status(500).json({ message: err.message || 'Server error.' });
+    }
+  }
+
+  const token  = process.env.WEBXPAY_TOKEN;
+  const cookie = process.env.WEBXPAY_COOKIE;
+
+  if (!token || !cookie) {
+    return res.status(500).json({ message: 'WebXPay credentials not configured on server.' });
+  }
+
+  try {
+    const url = new URL('https://signup.webxpay.com/api/merchant-manager/approval-view-list');
+    url.searchParams.set('page', page);
+    if (search) url.searchParams.set('search', search);
+
+    const response = await fetch(url.toString(), {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+        Authorization: `Bearer ${token}`,
+        Cookie: cookie,
+      },
+      redirect: 'follow',
+      timeout: 30000,
+    });
+
+    const text = await response.text();
+    let data;
+    try { data = JSON.parse(text); } catch {
+      return res.status(502).json({ message: 'WebXPay returned non-JSON response.' });
+    }
+
+    if (!response.ok) {
+      return res.status(response.status).json({ message: 'WebXPay API error.', data });
+    }
+
+    // Enrich each merchant with local DB data: channel, type, score, analysis status
+    const items = data?.data || [];
+    if (items.length > 0) {
+      const mids = items.map((m) => m.id).filter(Boolean);
+      const placeholders = mids.map(() => '?').join(',');
+
+      const [dbRows] = await db.query(
+        `SELECT
+           mi.mid,
+           mi.merchant_channel,
+           mi.onboarded_date,
+           mt.name            AS merchant_type_name,
+           mdjd.can_onboard,
+           mdjd.satisfaction_score,
+           mdjd.updated_at    AS last_analysis_at
+         FROM merchant_information mi
+         LEFT JOIN merchant_types mt ON mt.id = mi.merchant_type_id
+         LEFT JOIN merchant_document_json_data mdjd ON mdjd.mid = mi.mid
+         WHERE mi.mid IN (${placeholders})`,
+        mids
+      );
+
+      const dbMap = new Map();
+      dbRows.forEach((row) => dbMap.set(Number(row.mid), row));
+
+      data.data = items.map((m) => {
+        const local = dbMap.get(Number(m.id)) || {};
+        return {
+          ...m,
+          merchant_channel:   local.merchant_channel   || null,
+          merchant_type_name: local.merchant_type_name || null,
+          can_onboard:        local.can_onboard        != null ? local.can_onboard : null,
+          satisfaction_score: local.satisfaction_score != null ? local.satisfaction_score : null,
+          last_analysis_at:   local.last_analysis_at   || null,
+          onboarded_date:     local.onboarded_date     || m.onboarded_date || null,
+        };
+      });
+    }
+
+    return res.json(data);
+  } catch (err) {
+    console.error('fetchMerchantList error:', err);
+    return res.status(500).json({ message: err.message || 'Server error.' });
+  }
+};
+
+const downloadMerchantDocuments = async (req, res) => {
+  const { mid } = req.params;
+  const { PDFDocument } = require('pdf-lib');
+
+  try {
+    const systemData = await fetchWebxpayApprovalView(mid);
+    const allDocs = (systemData?.data?.all_documents || []).filter(
+      (d) => d.source !== 'outlet' && d.source !== 'outlets'
+    );
+
+    if (allDocs.length === 0) {
+      return res.status(404).json({ message: 'No documents found for this merchant.' });
+    }
+
+    const mergedPdf = await PDFDocument.create();
+    let pagesAdded = 0;
+
+    for (const doc of allDocs) {
+      const docUrl = doc.url || (doc.path ? `https://signup.webxpay.com${doc.path}` : null);
+      if (!docUrl) continue;
+
+      try {
+        const resp = await fetch(docUrl);
+        if (!resp.ok) continue;
+
+        const buffer = await resp.buffer();
+        const ct = (resp.headers.get('content-type') || '').toLowerCase();
+        const urlLower = docUrl.toLowerCase();
+
+        if (ct.includes('pdf') || urlLower.includes('.pdf')) {
+          const donor = await PDFDocument.load(buffer, { ignoreEncryption: true });
+          const copied = await mergedPdf.copyPages(donor, donor.getPageIndices());
+          copied.forEach((p) => mergedPdf.addPage(p));
+          pagesAdded += copied.length;
+        } else if (ct.includes('jpeg') || ct.includes('jpg') || urlLower.match(/\.(jpg|jpeg)/)) {
+          const img = await mergedPdf.embedJpg(buffer);
+          const page = mergedPdf.addPage([img.width, img.height]);
+          page.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
+          pagesAdded++;
+        } else if (ct.includes('png') || urlLower.includes('.png')) {
+          const img = await mergedPdf.embedPng(buffer);
+          const page = mergedPdf.addPage([img.width, img.height]);
+          page.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
+          pagesAdded++;
+        }
+      } catch (docErr) {
+        console.warn(`[download-docs] Skipped "${doc.label}":`, docErr.message);
+      }
+    }
+
+    if (pagesAdded === 0) {
+      return res.status(422).json({ message: 'Documents found but none could be processed.' });
+    }
+
+    const pdfBytes = await mergedPdf.save();
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': `attachment; filename="merchant_${mid}_documents.pdf"`,
+      'Content-Length': pdfBytes.length,
+    });
+    return res.send(Buffer.from(pdfBytes));
+  } catch (err) {
+    console.error('downloadMerchantDocuments error:', err);
+    return res.status(err.statusCode || 500).json({ message: err.message || 'Server error.' });
+  }
+};
+
+const getRuleOverrides = async (req, res) => {
+  const { mid } = req.params;
+  try {
+    const [rows] = await db.query(
+      `SELECT id, mid, rule_check_name, field_name, document_source, comment, created_at
+       FROM merchant_rule_overrides
+       WHERE mid = ?
+       ORDER BY created_at DESC`,
+      [mid]
+    );
+    return res.json(rows);
+  } catch (err) {
+    console.error('getRuleOverrides error:', err);
+    return res.status(500).json({ message: 'Server error.' });
+  }
+};
+
+const saveRuleOverride = async (req, res) => {
+  const { mid, rule_check_name, field_name, document_source, comment } = req.body;
+  if (!mid || !rule_check_name || !comment?.trim()) {
+    return res.status(400).json({ message: 'mid, rule_check_name, and comment are required.' });
+  }
+  try {
+    await db.query(
+      `INSERT INTO merchant_rule_overrides
+         (mid, rule_check_name, field_name, document_source, comment, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, NOW(), NOW())
+       ON DUPLICATE KEY UPDATE
+         comment = VALUES(comment),
+         updated_at = NOW()`,
+      [mid, rule_check_name, field_name || '', document_source || '', comment.trim()]
+    );
+    const [rows] = await db.query(
+      `SELECT id, mid, rule_check_name, field_name, document_source, comment, created_at
+       FROM merchant_rule_overrides
+       WHERE mid = ?
+       ORDER BY created_at DESC`,
+      [mid]
+    );
+    return res.json(rows);
+  } catch (err) {
+    console.error('saveRuleOverride error:', err);
+    return res.status(500).json({ message: 'Server error.' });
+  }
+};
+
+const getDashboardStats = async (req, res) => {
+  try {
+    const [[stats]] = await db.query(`
+      SELECT
+        COUNT(*)                                                                                    AS total,
+        SUM(CASE WHEN mdjd.can_onboard IS NOT NULL                                     THEN 1 ELSE 0 END) AS analyzed,
+        SUM(CASE WHEN mdjd.mid IS NULL OR mdjd.can_onboard IS NULL                     THEN 1 ELSE 0 END) AS remaining,
+        SUM(CASE WHEN mdjd.satisfaction_score >= 50                                    THEN 1 ELSE 0 END) AS above50,
+        SUM(CASE WHEN mdjd.satisfaction_score IS NOT NULL AND mdjd.satisfaction_score < 50 THEN 1 ELSE 0 END) AS below50
+      FROM merchant_information mi
+      LEFT JOIN merchant_document_json_data mdjd ON mdjd.mid = mi.mid
+    `);
+    return res.json({
+      total:     Number(stats.total)     || 0,
+      analyzed:  Number(stats.analyzed)  || 0,
+      remaining: Number(stats.remaining) || 0,
+      above50:   Number(stats.above50)   || 0,
+      below50:   Number(stats.below50)   || 0,
+    });
+  } catch (err) {
+    console.error('getDashboardStats error:', err);
+    return res.status(500).json({ message: 'Server error.' });
+  }
+};
+
+const deleteRuleOverride = async (req, res) => {
+  const { id } = req.params;
+  const { mid } = req.query;
+  try {
+    await db.query('DELETE FROM merchant_rule_overrides WHERE id = ?', [id]);
+    if (mid) {
+      const [rows] = await db.query(
+        `SELECT id, mid, rule_check_name, field_name, document_source, comment, created_at
+         FROM merchant_rule_overrides
+         WHERE mid = ?
+         ORDER BY created_at DESC`,
+        [mid]
+      );
+      return res.json(rows);
+    }
+    return res.json([]);
+  } catch (err) {
+    console.error('deleteRuleOverride error:', err);
+    return res.status(500).json({ message: 'Server error.' });
+  }
+};
+
 module.exports = {
   getRequirements, getAllMerchants, saveMerchant,
   uploadDocument, uploadUrl, getDocuments,
@@ -854,5 +1227,6 @@ module.exports = {
   runDataVerification, fetchExternalMerchant, runAiAnalysis, getLatestAnalysis,
   runFullApiVerification, runFullAnalysisForMid,
   triggerAutoRun, getAutoRunStatusHandler,
-  getAiUsage,
+  getAiUsage, downloadMerchantDocuments, fetchMerchantList, getDashboardStats,
+  getRuleOverrides, saveRuleOverride, deleteRuleOverride,
 };
