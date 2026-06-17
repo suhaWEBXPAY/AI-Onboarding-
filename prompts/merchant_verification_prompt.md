@@ -135,10 +135,17 @@ IMPORTANT RULES
 **Always extract and present all data fields, even from faulty, expired, substitute, or incomplete documents, for admin review and possible override.**
 If a director/secretary document is a certified true copy, clearly annotate it in the extracted data and verify the certifying authority, seal, and date (must be within 3 months). Otherwise, treat as FaultyDocument.
 
+**Document Label vs Content Validation (applies to every uploaded file):**
+- Before performing any other validation, check that each uploaded file's actual visual content matches its label.
+- If a file labelled as one document type (e.g. "Business Registration Certificate") clearly contains a completely different document (e.g. a National ID, Passport, or Bank Statement), add it to FaultyDocument with reason: "Document content does not match label: expected [label], found [actual type detected from content]."
+- Only flag a label/content mismatch when the content is unambiguously a different document type. If the document is unreadable or the type is uncertain, do not flag a mismatch.
+
 **Universal Date Comparison Rules — applies to EVERY date field in EVERY document:**
 - The reference date (TODAY) is injected at the top of this prompt. You MUST use that exact value for all date comparisons. NEVER substitute your model training cutoff or any assumed "current" date.
 - A date is "in the future" ONLY if it is provably STRICTLY AFTER the reference date under every reasonable format interpretation. If any reasonable interpretation places the date on or before the reference date, do NOT flag it as future.
 - **Year-level shortcut:** Any date whose year is numerically less than the reference year is ALWAYS in the past — never flag it as future, regardless of month or day values. Example: if the reference date is 2026-06-03, then any date in 2025 (e.g. 2025-10-04, 2025-12-31) is unconditionally in the past.
+- **Same-year shortcut:** If the year equals the reference year, compare month and day normally. Example: if the reference date is 2026-06-05, then 2026-03-23 is in the past and must NOT be flagged as future.
+- Example: if the reference date is 2026-06-05, then 2024-09-10 is in the past and must NOT be flagged as future.
 - **Same-year dates:** A date is future only when its month AND day are both provably later than the reference month and day. Example: 2026-03-20 is NOT future relative to 2026-06-03 because month 03 < month 06.
 - **Format ambiguity (YYYY-MM-DD vs YYYY-DD-MM vs DD-MM-YYYY etc.):** Sri Lankan documents use mixed formats. When the format is ambiguous, try all plausible interpretations. Only flag as future if ALL interpretations yield a date strictly after the reference date. If any interpretation yields a valid past date, use that interpretation and do NOT raise a future-date flag.
 - This rule applies without exception to: registration dates, incorporation dates, commencement dates, board/resolution/meeting dates, agreement dates, certification dates, NIC/passport issue dates, and any other date field extracted from any document.
@@ -220,8 +227,7 @@ If a director/secretary document is a certified true copy, clearly annotate it i
 
    - If the AoA objects clause states a regulated activity (e.g., pharmacy, medical, jewellery) AND the Board Resolution confirms or does not contradict it, require the corresponding license.
    - Nature of Business must be summarized in **3-4 words** as a short description, e.g., "Wholesale Food Trading", "Retail Pharmacy Services".
-   - Nature of Business must be summarized in **3-4 words** as a short description, e.g., "Wholesale Food Trading", "Retail Pharmacy Services".
-   - If the Board Resolution or other operating source shows a regulated industry, the mapped license is mandatory, not optional. Add the exact license name from the table below to required_documents and explain why it is needed.
+   - If the Board Resolution, AoA, or other operating source shows a regulated industry, the mapped license is mandatory, not optional. Add the exact license name from the table below to required_documents and explain exactly why it is needed using this format: `"Required because [Document Name] lists '[exact extracted activity phrase]', which requires [Exact License Name]."` Never output only a generic reason such as "regulated industry".
    - If a mandatory license is missing, expired, or inconsistent, list it as FaultyDocument and in required_documents, and set OnboardingEligibility.canOnboard=false.
    - Do NOT check Articles of Association certified true copy attestation date/staleness for this workflow. AoA has no 3-month recency requirement here. Only flag AoA if it is missing, unreadable, incomplete, tampered, or does not contain required company content.
 
@@ -234,6 +240,7 @@ If a director/secretary document is a certified true copy, clearly annotate it i
    | Airline Ticketing Agents            | Civil Aviation License                                |
    | Insurance                           | IBSL Certificate                                      |
    | Pharmacy                            | NMRA License                                          |
+   | Money Changers                      | Central Bank Money Changing License                   |
    | Wine / Liquor Stores / Bars         | Excise or Divisional Secretariat License              |
    | Fuel Stations                       | Fuel Distribution Agreement                           |
    | Doctors / Dentists                  | SLMC Registration                                     |

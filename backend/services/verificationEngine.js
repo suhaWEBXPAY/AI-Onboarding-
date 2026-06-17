@@ -412,6 +412,12 @@ const displayValue = (value) => {
   return JSON.stringify(value);
 };
 
+const sentence = (value = '') => {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  return /[.!?]$/.test(text) ? text : `${text}.`;
+};
+
 const normalizeIdentityToken = (value = '') => {
   const cleaned = String(value || '').replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
   return cleaned.length === 13 && /^\d{12}[vx]$/.test(cleaned)
@@ -831,6 +837,7 @@ const normalizeComparable = (value) => {
   return String(value)
     .toLowerCase()
     .trim()
+    .replace(/\bheadquarters\b/g, 'head office')
     .replace(/[.,/#!$%^&*;:{}=\-_`~()]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -986,6 +993,18 @@ const valuesEqual = (left, right, context = '') => {
     }
   }
 
+  if (key.includes('natureofbusiness') || key.includes('businessactivity') || key.includes('productcategories')) {
+    const genericBusinessTokens = new Set([
+      'business', 'products', 'product', 'trading', 'trade', 'exporting', 'export',
+      'importing', 'import', 'wholesale', 'retail', 'services', 'service', 'and',
+    ]);
+    const leftTokens = normalizeComparable(left).split(/\s+/).filter((token) => token.length > 2 && !genericBusinessTokens.has(token));
+    const rightTokens = normalizeComparable(right).split(/\s+/).filter((token) => token.length > 2 && !genericBusinessTokens.has(token));
+    const shorter = leftTokens.length <= rightTokens.length ? leftTokens : rightTokens;
+    const longer = leftTokens.length <= rightTokens.length ? rightTokens : leftTokens;
+    if (shorter.length && shorter.every((token) => longer.includes(token))) return true;
+  }
+
   return false;
 };
 
@@ -1023,6 +1042,108 @@ const stripAiDocumentLabel = (name) => String(name || '')
   .replace(/_/g, ' ')
   .trim();
 
+// Returns true only when a date string is provably future under EVERY reasonable
+// format interpretation. If any interpretation yields a past/present date, returns false.
+const isDateActuallyFuture = (dateStr) => {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const m = String(dateStr || '').match(/(\d{1,4})[-\/\.](\d{1,2})[-\/\.](\d{1,4})/);
+  if (!m) return true;
+  const a = Number(m[1]), b = Number(m[2]), c = Number(m[3]);
+  const candidates = [];
+  if (m[1].length === 4) { candidates.push(new Date(a, b - 1, c)); candidates.push(new Date(a, c - 1, b)); }
+  if (m[3].length === 4) { candidates.push(new Date(c, b - 1, a)); candidates.push(new Date(c, a - 1, b)); }
+  const valid = candidates.filter((d) => !isNaN(d.getTime()) && d.getFullYear() >= 1900 && d.getFullYear() <= today.getFullYear() + 10);
+  if (!valid.length) return true;
+  return !valid.some((d) => d <= today); // false = at least one interpretation is past
+};
+
+const isFalseFutureDateIssue = (row = {}) => {
+  const text = `${row.reason || ''} ${row.rule || ''}`;
+  if (!/\bfuture\b/i.test(text)) return false;
+  const dateText = [
+    row.value,
+    row.documentValue,
+    row.systemValue,
+    text,
+  ].map((part) => String(part || ' ')).join(' ');
+  const match = dateText.match(/\d{4}-\d{2}-\d{2}|\d{1,2}[-\/\.]\d{1,2}[-\/\.]\d{2,4}/);
+  return Boolean(match && !isDateActuallyFuture(match[0]));
+};
+
+// ── Onboarding severity policy ─────────────────────────────────────────────
+// Configured with the business: ONLY these categories block onboarding —
+//   1. A MANDATORY document is missing or invalid (this includes required
+//      regulatory licenses, which are added as mandatory document requirements).
+//   2. A bank-account detail mismatches / is invalid / is missing.
+//   3. A core identity field (name, NIC, passport, driving licence) has an issue.
+// Everything else (other field mismatches, source-only gaps, non-mandatory
+// document/field gaps) is a MINOR issue: the merchant may still be onboarded,
+// but is flagged "caution" for a human to glance at.
+const BANK_FIELD_RE = /\b(bank|a\/?c|account\s*(no|number|name|holder)?|branch|swift|iban|ifsc|sort\s*code|routing)\b/i;
+const IDENTITY_FIELD_RE = /\b(nic\b|national\s*id|identity\s*card|passport|driving\s*licen[cs]e|\bdl\b|full\s*name|holder\s*name|name\s*of\s*(the\s*)?(director|stakeholder|signatory|individual|proprietor|partner|owner)|director\s*name|signatory\s*name)\b/i;
+
+const issueHaystack = (row = {}) => `${row.field || ''} ${row.document || ''}`;
+const isBankIssueRow = (row) => BANK_FIELD_RE.test(issueHaystack(row));
+const isIdentityIssueRow = (row) => IDENTITY_FIELD_RE.test(issueHaystack(row));
+// Whole-document categories are already represented by documentChecks; only
+// field-level rows are considered for the bank/identity critical filter so we
+// don't double-count a missing mandatory document.
+const isFieldLevelRow = (row = {}) =>
+  row.category !== 'ai_required_document'
+  && row.category !== 'ai_document_presence'
+  && row.category !== 'ai_faulty_document';
+
+// Single source of truth for the verdict. Takes the cleaned issue arrays plus
+// the per-document validity checks and returns the 3-state status, the blocking
+// count, and human-readable blocking reasons for the eligibility rule check.
+const classifyOnboardingSeverity = ({
+  missingData = [],
+  invalidData = [],
+  mismatches = [],
+  documentOnlyData = [],
+  systemOnlyData = [],
+  documentChecks = [],
+}) => {
+  const mandatoryDocGaps = documentChecks.filter(
+    (c) => c.isMandatory && (!c.present || c.valid === false)
+  );
+  const missingMandatory = mandatoryDocGaps.filter((c) => !c.present);
+  const invalidMandatory = mandatoryDocGaps.filter((c) => c.present && c.valid === false);
+
+  const criticalFieldIssues = [...missingData, ...invalidData, ...mismatches]
+    .filter(isFieldLevelRow)
+    .filter((row) => isBankIssueRow(row) || isIdentityIssueRow(row));
+  const bankIssues = criticalFieldIssues.filter(isBankIssueRow);
+  const identityIssues = criticalFieldIssues.filter((r) => !isBankIssueRow(r) && isIdentityIssueRow(r));
+
+  const blockingCount = mandatoryDocGaps.length + criticalFieldIssues.length;
+
+  // Automatic verdict is binary: eligible merchants (no blocking issue) go straight
+  // to "verified", even if minor non-blocking issues exist. "caution" is reserved as
+  // a manual label a reviewer can assign — it is never produced automatically.
+  const status = blockingCount > 0 ? 'review_required' : 'verified';
+
+  const nameList = (arr) => {
+    const names = arr.map((c) => c.name).filter(Boolean);
+    return names.length ? ` (${names.slice(0, 3).join(', ')}${names.length > 3 ? ', …' : ''})` : '';
+  };
+  const blockingReasons = [];
+  if (missingMandatory.length) blockingReasons.push(`${missingMandatory.length} mandatory document(s) missing${nameList(missingMandatory)}`);
+  if (invalidMandatory.length) blockingReasons.push(`${invalidMandatory.length} mandatory document(s) invalid${nameList(invalidMandatory)}`);
+  if (bankIssues.length) blockingReasons.push(`${bankIssues.length} bank-detail issue(s)`);
+  if (identityIssues.length) blockingReasons.push(`${identityIssues.length} identity issue(s)`);
+
+  return { status, blockingCount, blockingReasons, mandatoryDocGaps, criticalFieldIssues };
+};
+
+const statusLabelFor = (status) => (
+  status === 'verified' ? 'Verified'
+    : status === 'caution' ? 'Caution — minor issues only'
+      : status === 'source_gap_review' ? 'Caution — minor issues only'
+        : 'Review required'
+);
+
 const systemOperationalBusinessText = (systemData = {}) => [
   systemData?.business_information?.nature_of_business,
   systemData?.business_information?.category_code_id,
@@ -1038,6 +1159,9 @@ const searchableText = (value) => {
 
 const documentOperationalBusinessText = (documentData = {}) => {
   const sourcedChunks = [];
+  const sourceChunks = [];
+  const sourceDocLabels = new Set();
+
   promptCoverageItems(documentData).forEach((item) => {
     const fieldNorm = normalizeKey(aiField(item, ''));
     if (![
@@ -1048,7 +1172,8 @@ const documentOperationalBusinessText = (documentData = {}) => {
       'categorycode',
     ].includes(fieldNorm)) return;
 
-    const docNorm = normalizeDocName(stripAiDocumentLabel(aiDocument(item, '')));
+    const rawDoc = aiDocument(item, '');
+    const docNorm = normalizeDocName(stripAiDocumentLabel(rawDoc));
     if (
       docNorm.includes('board resolution')
       || docNorm.includes('articles of association')
@@ -1056,54 +1181,107 @@ const documentOperationalBusinessText = (documentData = {}) => {
       || docNorm.includes('website')
       || docNorm.includes('system')
     ) {
-      sourcedChunks.push(searchableText(aiExtractedValue(item)));
+      const val = searchableText(aiExtractedValue(item));
+      if (val) {
+        sourcedChunks.push(val);
+        const docLabel = stripAiDocumentLabel(rawDoc);
+        sourceDocLabels.add(docLabel);
+        sourceChunks.push({ text: val, source: docLabel });
+      }
     }
   });
 
-  const fallbackChunks = [
-    documentData?.BusinessRegistration?.['Nature of Business'],
-    documentData?.BusinessRegistration?.NatureOfBusiness,
-    documentData?.BusinessRegistration?.['Category Code'],
-    documentData?.ArticlesOfAssociationDetails?.['Nature of Business'],
-    documentData?.ArticlesOfAssociationDetails?.NatureOfBusiness,
-    documentData?.WebsiteInsights?.['Product Categories'],
-  ].map(searchableText).filter(Boolean);
+  const fallbackSources = [
+    { value: documentData?.BusinessRegistration?.['Nature of Business'],   doc: 'Business Registration Certificate' },
+    { value: documentData?.BusinessRegistration?.NatureOfBusiness,         doc: 'Business Registration Certificate' },
+    { value: documentData?.BusinessRegistration?.['Category Code'],        doc: 'Business Registration Certificate' },
+    { value: documentData?.ArticlesOfAssociationDetails?.['Nature of Business'], doc: 'Articles of Association' },
+    { value: documentData?.ArticlesOfAssociationDetails?.NatureOfBusiness, doc: 'Articles of Association' },
+    { value: documentData?.WebsiteInsights?.['Product Categories'],        doc: 'Website / Social Media URL' },
+  ];
 
-  return (sourcedChunks.length ? sourcedChunks : fallbackChunks).join(' ');
-};
+  if (!sourcedChunks.length) {
+    fallbackSources.forEach(({ value, doc }) => {
+      const val = searchableText(value);
+      if (val) {
+        sourcedChunks.push(val);
+        sourceDocLabels.add(doc);
+        sourceChunks.push({ text: val, source: doc });
+      }
+    });
+  }
 
-const inferRequiredLicensesFromText = (value = '') => {
-  const text = normalizeComparable(value);
-  const licenses = [];
-  const add = (license) => {
-    if (!licenses.includes(license)) licenses.push(license);
+  return {
+    text: (sourcedChunks.length ? sourcedChunks : []).join(' '),
+    sourceDocLabels: [...sourceDocLabels],
+    sourceChunks,
   };
-
-  if (/\b(ayurved\w*|homeopath\w*)\b/.test(text)) add('Ayurveda / Homeopathy Council Registration');
-  if (/\b(clinic|hospital|medical centre|medical center|diagnostic|laborator\w*|healthcare)\b/.test(text)) add('PHSRC License');
-  if (/\b(pharmacy|pharma\w*|pharmaceutical\w*|drug|medicine|medical equipment|medical device|cosmetic\w*|nmra)\b/.test(text)) add('NMRA License');
-  if (/\b(gem|jewel\w*)\b/.test(text)) add('National Gem & Jewelry Authority License');
-  if (/\b(hotel|lodging|travel agent|tour operator|tourism|slt?da)\b/.test(text)) add('SLTDA License');
-  if (/\b(telecom|telecommunication|trcsl)\b/.test(text)) add('TRCSL License');
-  if (/\b(airline|air ticket|ticketing agent|civil aviation)\b/.test(text)) add('Civil Aviation License');
-  if (/\b(insurance|ibsl)\b/.test(text)) add('IBSL Certificate');
-  if (/\b(wine|liquor|bar|alcohol|excise)\b/.test(text)) add('Excise or Divisional Secretariat License');
-  if (/\b(fuel station|fuel distribution|petroleum)\b/.test(text)) add('Fuel Distribution Agreement');
-  if (/\b(doctor|dentist|dental|slmc)\b/.test(text)) add('SLMC Registration');
-  if (/\b(veterinary|veterinarian|vet\b)\b/.test(text)) add('Veterinary Council Registration');
-  if (/\b(lawyer|legal service|attorney|bar association)\b/.test(text)) add('Bar Association Registration');
-
-  return licenses;
 };
+
+const LICENSE_RULES = [
+  { license: 'Ayurveda / Homeopathy Council Registration', pattern: /\b(ayurved\w*|homeopath\w*)\b/ },
+  { license: 'PHSRC License', pattern: /\b(clinic|hospital|medical centre|medical center|diagnostic|laborator\w*|healthcare)\b/ },
+  { license: 'NMRA License', pattern: /\b(pharmacy|pharma\w*|pharmaceutical\w*|drug|medicine|medical equipment|medical device|cosmetic\w*|nmra)\b/ },
+  { license: 'National Gem & Jewelry Authority License', pattern: /\b(gems?\s+(?:and\s+)?jewel\w*|jewel\w*)\b/ },
+  { license: 'SLTDA License', pattern: /\b(hotel|lodging|travel agent|tour operator|tourism|slt?da)\b/ },
+  { license: 'Central Bank Money Changing License', pattern: /\b(money changer|money changers|money changing|foreign currency exchange)\b/ },
+  { license: 'TRCSL License', pattern: /\b(telecom|telecommunication|trcsl)\b/ },
+  { license: 'Civil Aviation License', pattern: /\b(airline|air ticket|ticketing agent|civil aviation)\b/ },
+  { license: 'IBSL Certificate', pattern: /\b(insurance|ibsl)\b/ },
+  { license: 'Excise or Divisional Secretariat License', pattern: /\b(wine|liquor|bar|alcohol|excise)\b/ },
+  { license: 'Fuel Distribution Agreement', pattern: /\b(fuel station|fuel distribution|petroleum)\b/ },
+  { license: 'SLMC Registration', pattern: /\b(doctor|dentist|dental|slmc)\b/ },
+  { license: 'Veterinary Council Registration', pattern: /\b(veterinary|veterinarian|vet\b)\b/ },
+  { license: 'Bar Association Registration', pattern: /\b(lawyer|legal service|attorney|bar association)\b/ },
+];
+
+const inferRequiredLicenseDetailsFromChunks = (chunks = []) => {
+  const byLicense = new Map();
+  chunks.forEach((chunk) => {
+    const text = normalizeComparable(chunk.text || '');
+    if (!text) return;
+    LICENSE_RULES.forEach((rule) => {
+      const match = text.match(rule.pattern);
+      if (!match) return;
+      const existing = byLicense.get(rule.license);
+      const trigger = match[0];
+      const source = chunk.source || 'business activity information';
+      const detail = {
+        license: rule.license,
+        trigger,
+        source,
+        reason: `Mandatory because ${source} lists "${trigger}", which requires ${rule.license}.`,
+      };
+      if (!existing || normalizeKey(source).includes('articlesofassociation')) {
+        byLicense.set(rule.license, detail);
+      }
+    });
+  });
+  return [...byLicense.values()];
+};
+
+const inferRequiredLicensesFromText = (value = '') => (
+  inferRequiredLicenseDetailsFromChunks([{ text: value, source: 'business activity information' }])
+    .map((detail) => detail.license)
+);
 
 const operationalBusinessText = (documentData = {}, systemData = {}) => [
-  documentOperationalBusinessText(documentData),
+  documentOperationalBusinessText(documentData).text,
   systemOperationalBusinessText(systemData),
 ].filter(Boolean).join(' ');
 
 const requiredOperationalLicenses = (documentData = {}, systemData = {}) => (
   inferRequiredLicensesFromText(operationalBusinessText(documentData, systemData))
 );
+
+const requiredOperationalLicenseDetails = (documentData = {}, systemData = {}) => {
+  const docInfo = documentOperationalBusinessText(documentData);
+  const chunks = [
+    ...docInfo.sourceChunks,
+    { text: systemOperationalBusinessText(systemData), source: 'WebXPay system nature of business' },
+  ].filter((chunk) => !isBlank(chunk.text));
+  return inferRequiredLicenseDetailsFromChunks(chunks);
+};
 
 const hasRegulatedOperationalNature = (systemData = {}, documentData = {}) => {
   const text = operationalBusinessText(documentData, systemData);
@@ -1115,6 +1293,14 @@ const isRegulatoryLicenseRequirement = (documentName, reason = '') => {
   const text = normalizeComparable(`${documentName || ''} ${reason || ''}`);
   return /\b(regulatory license|regulatory licence|license|licence|phsrc|nmra|ayurved\w*|homeopath\w*|medical|pharma\w*|cosmetic\w*|council)\b/.test(text)
     && /\b(license|licence|registration|approval|certificate)\b/.test(text);
+};
+
+const isGenericRegulatoryLicenseRequirement = (documentName = '') => {
+  const key = normalizeKey(documentName);
+  return key === 'regulatorylicense'
+    || key === 'licenseifrequired'
+    || key === 'regulatoryorbusinessspecificlicenses'
+    || key === 'regulatorybusinessspecificlicenses';
 };
 
 const isForm20Requirement = (documentName) => normalizeKey(documentName).includes('form20');
@@ -1141,6 +1327,11 @@ const shouldKeepAiRequiredDocument = ({ documentName, reason, requirements, syst
   const matchedReq = requirements.find((req) => namesMatch(req.required_docs, documentName));
   if (matchedReq?.is_mandatory) return true;
 
+  if (
+    isGenericRegulatoryLicenseRequirement(documentName)
+    && requiredOperationalLicenseDetails(documentData, systemData).length
+  ) return false;
+
   if (isForm20Requirement(documentName)) {
     return isDirectorIdentityForm20Reason(reason);
   }
@@ -1153,7 +1344,9 @@ const shouldKeepAiRequiredDocument = ({ documentName, reason, requirements, syst
 };
 
 const mergeDynamicLicenseRequirements = (requirements = [], documentData = {}, systemData = {}) => {
-  const detectedLicenseNames = requiredOperationalLicenses(documentData, systemData);
+  const detectedLicenseDetails = requiredOperationalLicenseDetails(documentData, systemData);
+  const detectedLicenseNames = detectedLicenseDetails.map((detail) => detail.license);
+  const { sourceDocLabels } = documentOperationalBusinessText(documentData);
 
   // Also surface licenses the AI explicitly named in its DocumentRequirements output
   const aiRequiredDocs = documentData?.DocumentRequirements?.required_documents;
@@ -1175,25 +1368,35 @@ const mergeDynamicLicenseRequirements = (requirements = [], documentData = {}, s
   const licenseNames = [...detectedLicenseNames, ...aiLicenseNames];
   if (!licenseNames.length) return requirements;
 
+  const sourceSummary = sourceDocLabels.length
+    ? `Detected in: ${sourceDocLabels.join(', ')}.`
+    : 'Detected from business activity information.';
+
   const merged = requirements.map((req) => {
     if (!isRegulatoryLicenseRequirement(req.required_docs, req.description || '')) return req;
+    if (isGenericRegulatoryLicenseRequirement(req.required_docs) && detectedLicenseDetails.length) {
+      return req;
+    }
     return {
       ...req,
       is_mandatory: true,
-      description: [
-        `Mandatory because operating activity requires: ${licenseNames.join(', ')}.`,
-        req.description || '',
-      ].filter(Boolean).join(' '),
+      description: detectedLicenseDetails.length
+        ? detectedLicenseDetails.map((detail) => detail.reason).join(' ')
+        : `Required because the operating activity detected in your documents requires this regulatory license. ${sourceSummary}`,
+      licenseSourceDocs: sourceDocLabels,
     };
   });
 
   licenseNames.forEach((licenseName) => {
     if (merged.some((req) => namesMatch(req.required_docs, licenseName))) return;
+    const detail = detectedLicenseDetails.find((item) => namesMatch(item.license, licenseName));
     merged.push({
       id: `dynamic-${normalizeKey(licenseName)}`,
       required_docs: licenseName,
-      description: 'Mandatory because the operating activity requires this regulatory license.',
+      description: detail?.reason || `Required because the operating activity detected in your documents requires this regulatory license. ${sourceSummary}`,
       is_mandatory: true,
+      licenseSourceDocs: detail?.source ? [detail.source] : sourceDocLabels,
+      licenseTrigger: detail?.trigger || null,
     });
   });
 
@@ -1443,6 +1646,18 @@ const isCorporateSecretaryCoverageGroup = (item, stakeholderRouting) => {
 
   return /\b(pvt|private limited|limited liability|company registration|corporate entity|secretary registration|sec\s*frm)\b/i
     .test(text.replace(/[\/_-]+/g, ' '));
+};
+
+const findPreferredSystemRowForPromptField = ({ section, field }, systemFlatRows) => {
+  const sectionNorm = normalizeKey(section || '');
+  const fieldNorm = normalizeKey(field || '');
+
+  if (sectionNorm === 'businessregistration' && fieldNorm === 'companyname') {
+    return systemFlatRows.find((row) => row.path === 'business_information.registered_name_of_business')
+      || systemFlatRows.find((row) => normalizeKey(row.path || '').endsWith('registerednameofbusiness'));
+  }
+
+  return null;
 };
 
 const flattenNameValues = (value) => {
@@ -1735,6 +1950,9 @@ const addPromptCoverageComparisons = (documentData, systemFlatRows, {
     if (!skipSystemComparison && stakeholderGroup?.systemPrefix) {
       const stakeholderRows = systemFlatRows.filter((r) => String(r.path || '').startsWith(`${stakeholderGroup.systemPrefix}.`));
       systemRow = findFlatValue(stakeholderRows, comparisonAliasesFor(field, section, documentName, apiSource));
+    }
+    if (!skipSystemComparison && !systemRow) {
+      systemRow = findPreferredSystemRowForPromptField({ section, field }, systemFlatRows);
     }
     if (!skipSystemComparison && !systemRow && !stakeholderGroup) {
       systemRow = findFlatValue(systemFlatRows, comparisonAliasesFor(field, section, documentName, apiSource));
@@ -2069,7 +2287,7 @@ const buildVerificationReport = ({
         field: requirement.required_docs,
         source: SOURCE_DOCUMENTS,
         document: requirement.required_docs,
-        reason: `Mandatory document not found in document extraction.${requirement.description ? ` ${requirement.description}.` : ''}`,
+        reason: `Mandatory document not found in document extraction.${requirement.description ? ` ${sentence(requirement.description)}` : ''}`,
         category: 'required_document',
       });
     }
@@ -2274,6 +2492,7 @@ const buildVerificationReport = ({
     if (isNonMandatoryAiDoc(row)) return false;
     if (isAoAAttestationDateIssue(row)) return false;
     if (isIdentityTypeOnlyMismatch(row)) return false;
+    if (isFalseFutureDateIssue(row)) return false;
     // Document-level AI findings (whole-document flags: label mismatches, duplicates,
     // attestation issues) are too unreliable to be blocking. Field-level invalids
     // (ai_invalid_data, ai_prompt_field) are kept.
@@ -2287,67 +2506,14 @@ const buildVerificationReport = ({
   const cleanSystemOnly = stripKeys(systemOnlyData);
   const cleanMatched = stripKeys(matchedData);
 
-  const criticalCount = cleanMissing.length + cleanInvalid.length + cleanMismatches.length;
-  const status = criticalCount > 0
-    ? 'review_required'
-    : (cleanDocumentOnly.length + cleanSystemOnly.length > 0 ? 'source_gap_review' : 'verified');
   const isAiPromptIssue = (row) => String(row.category || '').startsWith('ai_');
   const aiPromptIssueCount = [
     ...cleanMissing,
     ...cleanInvalid,
     ...cleanMismatches,
   ].filter(isAiPromptIssue).length;
-
-  const blockingCount = cleanMissing.length + cleanMismatches.length + cleanInvalid.length;
-  const ruleChecks = [
-    {
-      name: 'Onboarding eligibility',
-      status: blockingCount === 0 ? 'pass' : 'fail',
-      detail: blockingCount === 0
-        ? 'No blocking issues detected. This merchant appears eligible for onboarding.'
-        : `Cannot onboard: ${[
-            cleanMissing.length   ? `${cleanMissing.length} missing item(s)`      : '',
-            cleanMismatches.length ? `${cleanMismatches.length} data mismatch(es)` : '',
-            cleanInvalid.length   ? `${cleanInvalid.length} invalid field(s)`      : '',
-          ].filter(Boolean).join(', ')} must be resolved before approval.`,
-      isVerdict: true,
-    },
-    {
-      name: 'Required data coverage',
-      status: cleanMissing.length ? 'fail' : 'pass',
-      detail: cleanMissing.length
-        ? `${cleanMissing.length} required item(s) are missing from one or more API sources.`
-        : 'All prompt-reported required data and configured documents are present.',
-    },
-    {
-      name: 'Google AI document extraction vs external system cross-check',
-      status: cleanMismatches.length ? 'fail' : 'pass',
-      detail: cleanMismatches.length
-        ? `${cleanMismatches.length} field(s) do not match between sources.`
-        : 'Compared fields match across both sources.',
-    },
-    {
-      name: 'Format and validity rules',
-      status: cleanInvalid.length ? 'fail' : 'pass',
-      detail: cleanInvalid.length
-        ? `${cleanInvalid.length} field(s) failed format, expiry, or validity checks.`
-        : 'No invalid formats or expired values were detected.',
-    },
-    {
-      name: 'Prompt merchant-type rules',
-      status: aiPromptIssueCount ? 'fail' : 'pass',
-      detail: aiPromptIssueCount
-        ? `${aiPromptIssueCount} prompt-driven document or field rule issue(s) were reported by Google AI.`
-        : 'No prompt-driven merchant-type rule issues were reported by Google AI.',
-    },
-    {
-      name: 'Source capture coverage',
-      status: cleanDocumentOnly.length || cleanSystemOnly.length ? 'warning' : 'pass',
-      detail: cleanDocumentOnly.length || cleanSystemOnly.length
-        ? `${cleanDocumentOnly.length} document-only and ${cleanSystemOnly.length} system-only field(s) need review.`
-        : 'Both API sources expose the same compared fields.',
-    },
-  ];
+  // NOTE: status, blockingCount and ruleChecks are computed AFTER documentChecks
+  // (further down) because the verdict depends on mandatory-document validity.
 
   // ── Unified table ─────────────────────────────────────────────────────────
   // Single flat list that merges all categories so the frontend can render
@@ -2498,6 +2664,7 @@ const buildVerificationReport = ({
       const documentName = stripDocLabel(fault['Document Name'] || fault.document_name || fault.name || '');
       const reason = fault.Reason || fault.reason || fault.issue || '';
       if (isAoAAttestationDateIssue({ document: documentName, field: documentName, reason })) return;
+      if (isFalseFutureDateIssue({ document: documentName, field: documentName, reason })) return;
 
       const key = normalizeDocName(documentName);
       if (!key) return;
@@ -2516,8 +2683,10 @@ const buildVerificationReport = ({
     const invalidField = {
       field: aiField(item) || 'Unknown field',
       reason: aiReason(item, 'Field failed validation.'),
+      value: aiExtractedValue(item),
     };
     if (isAoAAttestationDateIssue({ document: key, ...invalidField })) return;
+    if (isFalseFutureDateIssue({ document: key, ...invalidField })) return;
     if (!invalidFieldsByDoc.has(key)) invalidFieldsByDoc.set(key, []);
     invalidFieldsByDoc.get(key).push(invalidField);
   });
@@ -2555,6 +2724,12 @@ const buildVerificationReport = ({
       const k = `${issue.type}|${issue.field || ''}|${issue.reason}`;
       if (seenIssues.has(k)) return false;
       seenIssues.add(k);
+      // Suppress false future-date flags: if the issue says "future" but the date
+      // is actually in the past under any reasonable format interpretation, drop it.
+      if (/\bfuture\b/i.test(issue.reason)) {
+        const dm = issue.reason.match(/\d{4}-\d{2}-\d{2}|\d{1,2}[-\/\.]\d{1,2}[-\/\.]\d{2,4}/);
+        if (dm && !isDateActuallyFuture(dm[0])) return false;
+      }
       return true;
     });
 
@@ -2565,8 +2740,70 @@ const buildVerificationReport = ({
       present,
       valid: !present ? false : uniqueIssues.length === 0,
       issues: uniqueIssues,
+      licenseSourceDocs: req.licenseSourceDocs || null,
     };
   });
+
+  // ── Verdict ────────────────────────────────────────────────────────────────
+  // Severity policy (see classifyOnboardingSeverity): only mandatory-document
+  // gaps and bank/identity issues block; everything else is a minor "caution".
+  const { status, blockingCount, blockingReasons } = classifyOnboardingSeverity({
+    missingData: cleanMissing,
+    invalidData: cleanInvalid,
+    mismatches: cleanMismatches,
+    documentOnlyData: cleanDocumentOnly,
+    systemOnlyData: cleanSystemOnly,
+    documentChecks,
+  });
+  const minorIssueCount = cleanMissing.length + cleanInvalid.length + cleanMismatches.length
+    + cleanDocumentOnly.length + cleanSystemOnly.length;
+  const ruleChecks = [
+    {
+      name: 'Onboarding eligibility',
+      status: blockingCount === 0 ? 'pass' : 'fail',
+      detail: blockingCount > 0
+        ? `Cannot onboard: ${blockingReasons.join('; ')} must be resolved before approval.`
+        : (minorIssueCount > 0
+            ? `Eligible for onboarding. ${minorIssueCount} minor, non-blocking issue(s) were noted for reference but do not block approval.`
+            : 'No issues detected. This merchant is eligible for onboarding.'),
+      isVerdict: true,
+    },
+    {
+      name: 'Required data coverage',
+      status: cleanMissing.length ? 'fail' : 'pass',
+      detail: cleanMissing.length
+        ? `${cleanMissing.length} required item(s) are missing from one or more API sources.`
+        : 'All prompt-reported required data and configured documents are present.',
+    },
+    {
+      name: 'Google AI document extraction vs external system cross-check',
+      status: cleanMismatches.length ? 'fail' : 'pass',
+      detail: cleanMismatches.length
+        ? `${cleanMismatches.length} field(s) do not match between sources.`
+        : 'Compared fields match across both sources.',
+    },
+    {
+      name: 'Format and validity rules',
+      status: cleanInvalid.length ? 'fail' : 'pass',
+      detail: cleanInvalid.length
+        ? `${cleanInvalid.length} field(s) failed format, expiry, or validity checks.`
+        : 'No invalid formats or expired values were detected.',
+    },
+    {
+      name: 'Prompt merchant-type rules',
+      status: aiPromptIssueCount ? 'fail' : 'pass',
+      detail: aiPromptIssueCount
+        ? `${aiPromptIssueCount} prompt-driven document or field rule issue(s) were reported by Google AI.`
+        : 'No prompt-driven merchant-type rule issues were reported by Google AI.',
+    },
+    {
+      name: 'Source capture coverage',
+      status: cleanDocumentOnly.length || cleanSystemOnly.length ? 'warning' : 'pass',
+      detail: cleanDocumentOnly.length || cleanSystemOnly.length
+        ? `${cleanDocumentOnly.length} document-only and ${cleanSystemOnly.length} system-only field(s) need review.`
+        : 'Both API sources expose the same compared fields.',
+    },
+  ];
 
   return {
     mid: mid || null,
@@ -2574,9 +2811,9 @@ const buildVerificationReport = ({
     merchantType: merchantType || null,
     generatedAt: new Date().toISOString(),
     status,
-    statusLabel: status === 'verified'
-      ? 'Verified'
-      : (status === 'source_gap_review' ? 'Source gap review' : 'Review required'),
+    statusLabel: statusLabelFor(status),
+    blockingCount,
+    minorIssueCount,
     summary: {
       receivedDocuments: apiDocLabels.length || documents.length,
       configuredRequirements: effectiveRequirements.length,
@@ -2650,12 +2887,17 @@ const patchReportCompatibleMismatches = (report, compatibleFields) => {
     })),
   ];
 
-  const blockingCount = (report.missingData || []).length + keptMismatches.length + (report.invalidData || []).length;
-  const newStatus = blockingCount > 0
-    ? 'review_required'
-    : ((report.documentOnlyData || []).length + (report.systemOnlyData || []).length > 0
-      ? 'source_gap_review'
-      : 'verified');
+  // Re-run the severity policy on the patched arrays so the verdict stays
+  // consistent with buildVerificationReport (mandatory docs + bank/identity block;
+  // everything else is a minor "caution").
+  const { status: newStatus, blockingCount, blockingReasons } = classifyOnboardingSeverity({
+    missingData: report.missingData || [],
+    invalidData: report.invalidData || [],
+    mismatches: keptMismatches,
+    documentOnlyData: report.documentOnlyData || [],
+    systemOnlyData: report.systemOnlyData || [],
+    documentChecks: report.documentChecks || [],
+  });
 
   const aiPromptIssueCount = [
     ...(report.missingData || []),
@@ -2668,13 +2910,9 @@ const patchReportCompatibleMismatches = (report, compatibleFields) => {
       return {
         ...check,
         status: blockingCount === 0 ? 'pass' : 'fail',
-        detail: blockingCount === 0
-          ? 'No blocking issues detected. This merchant appears eligible for onboarding.'
-          : `Cannot onboard: ${[
-              (report.missingData || []).length ? `${report.missingData.length} missing item(s)` : '',
-              keptMismatches.length ? `${keptMismatches.length} data mismatch(es)` : '',
-              (report.invalidData || []).length ? `${report.invalidData.length} invalid field(s)` : '',
-            ].filter(Boolean).join(', ')} must be resolved before approval.`,
+        detail: blockingCount > 0
+          ? `Cannot onboard: ${blockingReasons.join('; ')} must be resolved before approval.`
+          : 'Eligible for onboarding. Any remaining issues are minor and non-blocking.',
       };
     }
     if (check.name === 'Google AI document extraction vs external system cross-check') {
@@ -2701,9 +2939,8 @@ const patchReportCompatibleMismatches = (report, compatibleFields) => {
   return {
     ...report,
     status: newStatus,
-    statusLabel: newStatus === 'verified'
-      ? 'Verified'
-      : (newStatus === 'source_gap_review' ? 'Source gap review' : 'Review required'),
+    statusLabel: statusLabelFor(newStatus),
+    blockingCount,
     summary: {
       ...(report.summary || {}),
       matchedFields: newMatchedData.length,

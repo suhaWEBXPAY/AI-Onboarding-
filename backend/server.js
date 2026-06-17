@@ -54,6 +54,34 @@ const runMigrations = async () => {
       )
     `);
     console.log('[migration] merchant_rule_overrides table ready.');
+
+    // Status columns on merchant_document_json_data:
+    //   computed_status — the verdict produced by analysis (verified | caution | review_required)
+    //   review_status   — a human override (verified | caution | review); NULL = use computed_status
+    const [statusCols] = await db.query(`
+      SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND TABLE_NAME   = 'merchant_document_json_data'
+        AND COLUMN_NAME IN ('computed_status', 'review_status', 'review_status_by', 'review_status_at')
+    `);
+    const haveCol = new Set(statusCols.map((c) => c.COLUMN_NAME));
+    const addColumns = [];
+    if (!haveCol.has('computed_status'))  addColumns.push('ADD COLUMN computed_status  VARCHAR(30) NULL DEFAULT NULL');
+    if (!haveCol.has('review_status'))    addColumns.push('ADD COLUMN review_status    VARCHAR(30) NULL DEFAULT NULL');
+    if (!haveCol.has('review_status_by')) addColumns.push('ADD COLUMN review_status_by  VARCHAR(150) NULL DEFAULT NULL');
+    if (!haveCol.has('review_status_at')) addColumns.push('ADD COLUMN review_status_at  TIMESTAMP NULL DEFAULT NULL');
+    if (addColumns.length) {
+      await db.query(`ALTER TABLE merchant_document_json_data ${addColumns.join(', ')}`);
+      console.log(`[migration] Added ${addColumns.length} status column(s) to merchant_document_json_data.`);
+    }
+
+    // Backfill computed_status for rows analyzed before this column existed,
+    // deriving from the existing can_onboard flag (no caution data available retroactively).
+    await db.query(`
+      UPDATE merchant_document_json_data
+      SET computed_status = CASE WHEN can_onboard = 1 THEN 'verified' ELSE 'review_required' END
+      WHERE computed_status IS NULL AND can_onboard IS NOT NULL
+    `);
   } catch (err) {
     console.error('[migration] Error running migrations:', err.message);
   }

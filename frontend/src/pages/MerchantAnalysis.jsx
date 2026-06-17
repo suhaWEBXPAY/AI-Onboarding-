@@ -107,6 +107,30 @@ const STATUS_CONFIG = {
   api_only: { label: 'System Data',      tone: 'sys',     symbol: '↘' },
 };
 
+// Merchant-level onboarding status (computed verdict or human override).
+// review_required (computed) and review (manual) collapse to the same display.
+const ONBOARD_STATUS = {
+  verified: { label: 'Verified', tone: 'success', symbol: '✓' },
+  caution:  { label: 'Caution',  tone: 'warn',    symbol: '⚠' },
+  review:   { label: 'Review',   tone: 'danger',  symbol: '✗' },
+};
+const normalizeOnboardStatus = (s) => {
+  const v = String(s || '').toLowerCase();
+  if (v === 'verified') return 'verified';
+  // Legacy 'source_gap_review' meant only source gaps (no critical issue) → caution.
+  if (v === 'caution' || v === 'source_gap_review') return 'caution';
+  if (v === 'review' || v === 'review_required') return 'review';
+  return null;
+};
+// Resolve a merchant row's effective status from whatever fields are present.
+const effectiveStatusOf = (m) => {
+  if (!m) return null;
+  const direct = normalizeOnboardStatus(m.effective_status || m.review_status || m.computed_status);
+  if (direct) return direct;
+  if (m.can_onboard == null) return null;        // not analyzed yet
+  return m.can_onboard ? 'verified' : 'review';  // legacy rows without status columns
+};
+
 const FILTER_OPTIONS = [
   { key: 'all',      label: 'All'               },
   { key: 'mismatch', label: 'Mismatch'          },
@@ -545,7 +569,9 @@ function RuleCheckItem({ check, report, allDocuments = [], mid, overrides = [], 
   );
 }
 
-function DocumentChecksTable({ checks = [], overrides = [] }) {
+function DocumentChecksTable({ checks = [], overrides = [], allDocuments = [] }) {
+  const [viewerDoc, setViewerDoc] = useState(null);
+
   if (!checks.length) return null;
 
   const getEffectiveIssues = (check) =>
@@ -558,6 +584,8 @@ function DocumentChecksTable({ checks = [], overrides = [] }) {
   const validCount   = checks.filter((c) => c.present && getEffectiveIssues(c).length === 0).length;
   const issueCount   = checks.filter((c) => c.present && getEffectiveIssues(c).length > 0).length;
   const missingCount = checks.filter((c) => !c.present).length;
+
+  const hasSourceDocs = checks.some((c) => c.licenseSourceDocs?.length);
 
   return (
     <div className="card">
@@ -593,7 +621,8 @@ function DocumentChecksTable({ checks = [], overrides = [] }) {
               <th style={{ width: 100 }}>Required</th>
               <th style={{ width: 90 }}>Present</th>
               <th style={{ width: 90 }}>Valid</th>
-              <th>Issues</th>
+              <th>Issues / Reason</th>
+              {hasSourceDocs && <th style={{ width: 160 }}>Source Documents</th>}
             </tr>
           </thead>
           <tbody>
@@ -605,6 +634,11 @@ function DocumentChecksTable({ checks = [], overrides = [] }) {
                 : !effectiveValid
                   ? 'unified-row--warn'
                   : 'unified-row--success';
+
+              const sourceDocs = (check.licenseSourceDocs || [])
+                .map((label) => findDocByLabel(label, allDocuments))
+                .filter(Boolean);
+
               return (
                 <tr key={check.name} className={`unified-row ${rowClass}`}>
                   <td className="td-name">{check.name}</td>
@@ -628,26 +662,57 @@ function DocumentChecksTable({ checks = [], overrides = [] }) {
                     }
                   </td>
                   <td className="td-value">
-                    {effectiveIssues.length === 0
+                    {effectiveIssues.length === 0 && !check.description
                       ? <span style={{ color: 'var(--ash)' }}>—</span>
                       : (
-                        <ul style={{ margin: 0, paddingLeft: 16, fontSize: 12, lineHeight: 1.6 }}>
-                          {effectiveIssues.map((issue, i) => (
-                            <li key={i}>
-                              {issue.field && <strong>{issue.field}: </strong>}
-                              {issue.reason}
-                            </li>
-                          ))}
-                        </ul>
+                        <div style={{ fontSize: 12, lineHeight: 1.6 }}>
+                          {check.description && (
+                            <div style={{ marginBottom: effectiveIssues.length ? 6 : 0, color: 'var(--text-muted)' }}>
+                              {check.description}
+                            </div>
+                          )}
+                          {effectiveIssues.length > 0 && (
+                            <ul style={{ margin: 0, paddingLeft: 16 }}>
+                              {effectiveIssues.map((issue, i) => (
+                                <li key={i}>
+                                  {issue.field && <strong>{issue.field}: </strong>}
+                                  {issue.reason}
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                        </div>
                       )
                     }
                   </td>
+                  {hasSourceDocs && (
+                    <td className="td-value">
+                      {sourceDocs.length > 0 ? (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                          {sourceDocs.map((doc, i) => (
+                            <button
+                              key={i}
+                              type="button"
+                              className="btn-doc-open"
+                              onClick={() => setViewerDoc(doc)}
+                              title={`View ${doc.label || check.licenseSourceDocs[i]}`}
+                            >
+                              {doc.label || check.licenseSourceDocs[i]}
+                            </button>
+                          ))}
+                        </div>
+                      ) : (
+                        <span style={{ color: 'var(--ash)', fontSize: 12 }}>—</span>
+                      )}
+                    </td>
+                  )}
                 </tr>
               );
             })}
           </tbody>
         </table>
       </div>
+      {viewerDoc && <DocViewerModal doc={viewerDoc} onClose={() => setViewerDoc(null)} />}
     </div>
   );
 }
@@ -749,6 +814,9 @@ const DASH_CARDS = [
   { key: null,        label: 'Total Merchants',  tone: 'neutral',  icon: '▤' },
   { key: 'analyzed',  label: 'Analyzed',         tone: 'success',  icon: '✓' },
   { key: 'remaining', label: 'Remaining',        tone: 'warn',     icon: '⏳' },
+  { key: 'verified',  label: 'Verified',         tone: 'success',  icon: '✓' },
+  { key: 'caution',   label: 'Caution',          tone: 'warn',     icon: '⚠' },
+  { key: 'review',    label: 'Needs Review',     tone: 'danger',   icon: '✗' },
   { key: 'above50',   label: 'Score ≥ 50%',      tone: 'success',  icon: '↑' },
   { key: 'below50',   label: 'Score < 50%',      tone: 'danger',   icon: '↓' },
 ];
@@ -785,6 +853,44 @@ function DashboardStats({ stats, meta, activeFilter, onFilter }) {
           </button>
         );
       })}
+    </div>
+  );
+}
+
+// Human-settable onboarding status. Lets a reviewer override the computed verdict
+// (e.g. confirm a flagged merchant as Verified, or downgrade one to Caution).
+function ReviewStatusControl({ status, isOverridden, onSet, busy }) {
+  const OPTIONS = ['verified', 'caution', 'review'];
+  return (
+    <div className="ma-status-control">
+      <span className="form-label" style={{ marginBottom: 0 }}>Onboarding status</span>
+      <div className="ma-status-seg">
+        {OPTIONS.map((key) => {
+          const cfg = ONBOARD_STATUS[key];
+          const active = status === key;
+          return (
+            <button
+              key={key}
+              type="button"
+              className={`ma-status-seg-btn ma-status-seg-btn--${cfg.tone}${active ? ' is-active' : ''}`}
+              onClick={() => onSet(key)}
+              disabled={busy || active}
+              title={`Mark this merchant as ${cfg.label}`}
+            >
+              {cfg.symbol} {cfg.label}
+            </button>
+          );
+        })}
+      </div>
+      {isOverridden
+        ? (
+          <button type="button" className="ma-status-revert" onClick={() => onSet('auto')} disabled={busy} title="Discard the manual override and use the system-computed verdict">
+            ↺ Use auto
+          </button>
+        )
+        : <span className="ma-status-origin">Set automatically by analysis</span>
+      }
+      {isOverridden && <span className="ma-status-origin ma-status-origin--manual">● Manually set by reviewer</span>}
     </div>
   );
 }
@@ -838,7 +944,9 @@ function MerchantTable({ merchants, loading, meta, page, onPageChange, onSelect 
                 : score >= 70 ? 'success'
                 : score >= 40 ? 'warn'
                 : 'danger';
-              const analyzed = merchant.can_onboard != null;
+              const effStatus = effectiveStatusOf(merchant);
+              const statusCfg = effStatus ? ONBOARD_STATUS[effStatus] : null;
+              const isOverridden = Boolean(merchant.review_status);
               return (
                 <tr
                   key={merchant.mid}
@@ -856,11 +964,15 @@ function MerchantTable({ merchants, loading, meta, page, onPageChange, onSelect 
                     }
                   </td>
                   <td style={{ textAlign: 'center' }}>
-                    {!analyzed
+                    {!statusCfg
                       ? <span className="unified-status-badge unified-status-badge--sys" style={{ fontSize: 11 }}>Pending</span>
-                      : merchant.can_onboard
-                        ? <span className="unified-status-badge unified-status-badge--success" style={{ fontSize: 11 }}>✓ Clear</span>
-                        : <span className="unified-status-badge unified-status-badge--danger" style={{ fontSize: 11 }}>✗ Review</span>
+                      : <span
+                          className={`unified-status-badge unified-status-badge--${statusCfg.tone}`}
+                          style={{ fontSize: 11 }}
+                          title={isOverridden ? 'Manually set by a reviewer' : 'Set automatically by analysis'}
+                        >
+                          {statusCfg.symbol} {statusCfg.label}{isOverridden ? ' •' : ''}
+                        </span>
                     }
                   </td>
                 </tr>
@@ -904,6 +1016,7 @@ export default function MerchantAnalysis() {
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [running, setRunning] = useState(false);
   const [autoRunning, setAutoRunning] = useState(false);
+  const [statusBusy, setStatusBusy] = useState(false);
   const [message, setMessage] = useState({ text: '', type: '' });
   const searchTimer = useRef(null);
   const location = useLocation();
@@ -940,6 +1053,9 @@ export default function MerchantAnalysis() {
         merchant_type_name: m.merchant_type_name || null,
         can_onboard:        m.can_onboard        != null ? m.can_onboard : null,
         satisfaction_score: m.satisfaction_score != null ? m.satisfaction_score : null,
+        computed_status:    m.computed_status    || null,
+        review_status:      m.review_status      || null,
+        effective_status:   m.effective_status   || null,
         last_analysis_at:   m.last_analysis_at   || null,
       }));
       setMerchants(mapped);
@@ -989,6 +1105,12 @@ export default function MerchantAnalysis() {
         latest_analysis_at: analysisData?.created_at ?? prev.latest_analysis_at,
         can_onboard: analysisData?.can_onboard ?? prev.can_onboard,
         satisfaction_score: analysisData?.satisfaction_score ?? prev.satisfaction_score,
+        computed_status: analysisData?.computed_status ?? prev.computed_status,
+        review_status: analysisData?.review_status ?? null,
+        effective_status: analysisData?.effective_status
+          ?? analysisData?.review_status
+          ?? analysisData?.computed_status
+          ?? prev.effective_status,
       }));
     } else if (analysisResult.reason?.response?.status === 404) {
       setMessage({ text: 'No saved analysis for this merchant.', type: 'error' });
@@ -1080,7 +1202,11 @@ export default function MerchantAnalysis() {
       setSelectedMerchant((prev) => ({
         ...prev,
         latest_analysis_at: response.data.report?.generatedAt || new Date().toISOString(),
-        can_onboard: response.data.report?.status === 'verified' ? 1 : 0,
+        // Caution counts as onboardable; only a hard review_required blocks.
+        can_onboard: ['verified', 'caution'].includes(response.data.report?.status) ? 1 : 0,
+        // Re-analysis refreshes the computed verdict but keeps any manual override (review_status).
+        computed_status: response.data.report?.status || prev.computed_status,
+        effective_status: prev.review_status || response.data.report?.status || prev.effective_status,
         satisfaction_score: response.data.report?.summary
           ? Math.round(
             ((response.data.report.summary.matchedFields || 0)
@@ -1154,6 +1280,44 @@ export default function MerchantAnalysis() {
     }
   }, [selectedMerchant]);
 
+  // Manually set the merchant's onboarding status (verified / caution / review),
+  // or pass 'auto' to clear the override and fall back to the computed verdict.
+  const handleSetReviewStatus = useCallback(async (newStatus) => {
+    if (!selectedMerchant?.mid) return;
+    setStatusBusy(true);
+    try {
+      const { data } = await api.patch(
+        `/onboard-verification/review-status/${encodeURIComponent(selectedMerchant.mid)}`,
+        { review_status: newStatus }
+      );
+      // Update the detail header…
+      setSelectedMerchant((prev) => ({
+        ...prev,
+        review_status: data.review_status,
+        computed_status: data.computed_status ?? prev.computed_status,
+        effective_status: data.effective_status,
+        can_onboard: data.can_onboard,
+      }));
+      // …and the matching row in the list so the badge reflects it on back-navigation.
+      setMerchants((prev) => prev.map((m) => (
+        Number(m.mid) === Number(selectedMerchant.mid)
+          ? { ...m, review_status: data.review_status, computed_status: data.computed_status ?? m.computed_status, effective_status: data.effective_status, can_onboard: data.can_onboard }
+          : m
+      )));
+      setMessage({
+        text: data.review_status
+          ? `Status set to "${data.review_status}".`
+          : 'Status reverted to the system-computed verdict.',
+        type: 'success',
+      });
+      loadDashStats();
+    } catch (err) {
+      setMessage({ text: err.response?.data?.message || 'Failed to update status.', type: 'error' });
+    } finally {
+      setStatusBusy(false);
+    }
+  }, [selectedMerchant, loadDashStats]);
+
   useEffect(() => {
     loadMerchants('', 1);
     loadDashStats();
@@ -1180,7 +1344,6 @@ export default function MerchantAnalysis() {
               value={searchInput}
               onChange={handleSearchChange}
               placeholder="Search merchants by name…"
-              disabled={loadingMerchants}
             />
           </div>
         )}
@@ -1244,7 +1407,16 @@ export default function MerchantAnalysis() {
                 <span className="card-title-accent" />
                 {selectedMerchant.merchant_business_name || selectedMerchant.mid}
               </span>
-              <StatusPill status={report?.status} label={report?.statusLabel} />
+              {(() => {
+                const eff = effectiveStatusOf(selectedMerchant) || normalizeOnboardStatus(report?.status);
+                if (!eff) return <StatusPill status={report?.status} label={report?.statusLabel} />;
+                const cfg = ONBOARD_STATUS[eff];
+                return (
+                  <span className={`unified-status-badge unified-status-badge--${cfg.tone}`} style={{ fontSize: 12 }}>
+                    {cfg.symbol} {cfg.label}{selectedMerchant.review_status ? ' • manual' : ''}
+                  </span>
+                );
+              })()}
             </div>
             <div className="card-body">
               <div className="merchant-analysis-meta">
@@ -1265,6 +1437,15 @@ export default function MerchantAnalysis() {
                   <div className="td-name">{fmtDate(selectedMerchant.latest_analysis_at)}</div>
                 </div>
               </div>
+
+              {report && (
+                <ReviewStatusControl
+                  status={effectiveStatusOf(selectedMerchant) || normalizeOnboardStatus(report?.status)}
+                  isOverridden={Boolean(selectedMerchant.review_status)}
+                  onSet={handleSetReviewStatus}
+                  busy={statusBusy}
+                />
+              )}
 
               <div className="form-actions">
                 <button
@@ -1313,7 +1494,7 @@ export default function MerchantAnalysis() {
                 })}
                 allDocuments={allDocuments}
               />
-              <DocumentChecksTable checks={report.documentChecks || []} overrides={overrides} />
+              <DocumentChecksTable checks={report.documentChecks || []} overrides={overrides} allDocuments={allDocuments} />
             </>
           )}
 

@@ -12,6 +12,7 @@ const {
   triggerAutoRun, getAutoRunStatusHandler,
   downloadMerchantDocuments, fetchMerchantList, getDashboardStats,
   getRuleOverrides, saveRuleOverride, deleteRuleOverride,
+  updateReviewStatus,
 } = require('../controllers/onboardVerificationController');
 
 const upload = multer({
@@ -47,5 +48,6 @@ router.get('/dashboard-stats',             protect, getDashboardStats);
 router.get('/rule-overrides/:mid',         protect, getRuleOverrides);
 router.post('/rule-overrides',             protect, saveRuleOverride);
 router.delete('/rule-overrides/:id',       protect, deleteRuleOverride);
+router.patch('/review-status/:mid',        protect, updateReviewStatus);
 
 module.exports = router;

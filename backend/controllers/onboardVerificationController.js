@@ -477,7 +477,10 @@ const resolveMerchantContext = async (mid, webxpayData, merchantTypeIdFromReques
 };
 
 const saveVerificationSnapshot = async ({ mid, merchantTypeName, documentData, report }) => {
-  const canOnboard = report.status === 'verified' ? 1 : 0;
+  // Caution = minor non-blocking issues only → still allowed to onboard.
+  // Only review_required (a hard blocking issue) prevents onboarding.
+  const computedStatus = report.status || 'review_required';
+  const canOnboard = (computedStatus === 'verified' || computedStatus === 'caution') ? 1 : 0;
   const satisfactionScore = computeSatisfactionScore(report.summary);
   const extractedJson = JSON.stringify(documentData);
   const validationJson = JSON.stringify(report);
@@ -489,18 +492,20 @@ const saveVerificationSnapshot = async ({ mid, merchantTypeName, documentData, r
     );
 
     if (existing.length > 0) {
+      // Re-analysis refreshes the computed status but never clobbers a human's
+      // manual review_status override — that column is left untouched here.
       await db.query(
         `UPDATE merchant_document_json_data
-         SET document_type = ?, extracted_json = ?, validation_json = ?, can_onboard = ?, satisfaction_score = ?
+         SET document_type = ?, extracted_json = ?, validation_json = ?, can_onboard = ?, satisfaction_score = ?, computed_status = ?
          WHERE id = ?`,
-        [merchantTypeName, extractedJson, validationJson, canOnboard, satisfactionScore, existing[0].id]
+        [merchantTypeName, extractedJson, validationJson, canOnboard, satisfactionScore, computedStatus, existing[0].id]
       );
     } else {
       await db.query(
         `INSERT INTO merchant_document_json_data
-           (mid, merchant_document_id, document_type, uploaded_file_path, extracted_json, validation_json, can_onboard, satisfaction_score)
-         VALUES (?, NULL, ?, NULL, ?, ?, ?, ?)`,
-        [mid || null, merchantTypeName, extractedJson, validationJson, canOnboard, satisfactionScore]
+           (mid, merchant_document_id, document_type, uploaded_file_path, extracted_json, validation_json, can_onboard, satisfaction_score, computed_status)
+         VALUES (?, NULL, ?, NULL, ?, ?, ?, ?, ?)`,
+        [mid || null, merchantTypeName, extractedJson, validationJson, canOnboard, satisfactionScore, computedStatus]
       );
     }
   } catch (err) {
@@ -593,7 +598,8 @@ const getLatestAnalysis = async (req, res) => {
 
   try {
     const [rows] = await db.query(
-      `SELECT extracted_json, validation_json, can_onboard, satisfaction_score, created_at
+      `SELECT extracted_json, validation_json, can_onboard, satisfaction_score,
+              computed_status, review_status, review_status_by, review_status_at, created_at
        FROM merchant_document_json_data
        WHERE mid = ?
        ORDER BY created_at DESC
@@ -603,7 +609,9 @@ const getLatestAnalysis = async (req, res) => {
     if (rows.length === 0) {
       return res.status(404).json({ message: 'No analysis found for this MID.' });
     }
-    return res.json(rows[0]);
+    const row = rows[0];
+    row.effective_status = row.review_status || row.computed_status || null;
+    return res.json(row);
   } catch (err) {
     console.error('getLatestAnalysis error:', err);
     return res.status(500).json({ message: 'Server error.' });
@@ -726,6 +734,7 @@ const runAiAnalysis = async (req, res) => {
 
     const canOnboard = result?.OnboardingEligibility?.canOnboard === true ? 1 : 0;
     const satisfactionScore = result?.satisfactionaSocre?.score ?? result?.satisfactionScore?.score ?? null;
+    const computedStatus = canOnboard ? 'verified' : 'review_required';
 
     if (merchantTypeId) {
       try {
@@ -736,16 +745,16 @@ const runAiAnalysis = async (req, res) => {
         if (existing.length > 0) {
           await db.query(
             `UPDATE merchant_document_json_data
-             SET document_type = ?, extracted_json = ?, can_onboard = ?, satisfaction_score = ?
+             SET document_type = ?, extracted_json = ?, can_onboard = ?, satisfaction_score = ?, computed_status = ?
              WHERE id = ?`,
-            [merchantTypeName, JSON.stringify(result), canOnboard, satisfactionScore, existing[0].id]
+            [merchantTypeName, JSON.stringify(result), canOnboard, satisfactionScore, computedStatus, existing[0].id]
           );
         } else {
           await db.query(
             `INSERT INTO merchant_document_json_data
-               (mid, merchant_document_id, document_type, uploaded_file_path, extracted_json, validation_json, can_onboard, satisfaction_score)
-             VALUES (?, NULL, ?, NULL, ?, NULL, ?, ?)`,
-            [mid, merchantTypeName, JSON.stringify(result), canOnboard, satisfactionScore]
+               (mid, merchant_document_id, document_type, uploaded_file_path, extracted_json, validation_json, can_onboard, satisfaction_score, computed_status)
+             VALUES (?, NULL, ?, NULL, ?, NULL, ?, ?, ?)`,
+            [mid, merchantTypeName, JSON.stringify(result), canOnboard, satisfactionScore, computedStatus]
           );
         }
       } catch (dbErr) {
@@ -922,7 +931,9 @@ const fetchMerchantList = async (req, res) => {
   const search = req.query.search ? req.query.search.trim() : '';
   const filter = req.query.filter || '';
 
-  const VALID_FILTERS = ['analyzed', 'remaining', 'above50', 'below50'];
+  const VALID_FILTERS = ['analyzed', 'remaining', 'above50', 'below50', 'verified', 'caution', 'review'];
+  // Effective status = human override if set, else the computed verdict.
+  const EFFECTIVE_STATUS_SQL = 'COALESCE(mdjd.review_status, mdjd.computed_status)';
   if (filter && VALID_FILTERS.includes(filter)) {
     try {
       const perPage = 15;
@@ -934,6 +945,9 @@ const fetchMerchantList = async (req, res) => {
       if (filter === 'remaining') { whereExtra = 'AND (mdjd.mid IS NULL OR mdjd.can_onboard IS NULL)'; }
       if (filter === 'above50')   { joinType = 'INNER JOIN'; whereExtra = 'AND mdjd.satisfaction_score >= 50'; }
       if (filter === 'below50')   { joinType = 'INNER JOIN'; whereExtra = 'AND mdjd.satisfaction_score IS NOT NULL AND mdjd.satisfaction_score < 50'; }
+      if (filter === 'verified')  { joinType = 'INNER JOIN'; whereExtra = `AND ${EFFECTIVE_STATUS_SQL} = 'verified'`; }
+      if (filter === 'caution')   { joinType = 'INNER JOIN'; whereExtra = `AND ${EFFECTIVE_STATUS_SQL} = 'caution'`; }
+      if (filter === 'review')    { joinType = 'INNER JOIN'; whereExtra = `AND ${EFFECTIVE_STATUS_SQL} IN ('review','review_required')`; }
 
       const searchClause = search ? 'AND (mi.mid LIKE ? OR mi.merchant_business_name LIKE ?)' : '';
       const searchParams = search ? [`%${search}%`, `%${search}%`] : [];
@@ -956,6 +970,9 @@ const fetchMerchantList = async (req, res) => {
            mt.name                       AS merchant_type_name,
            mdjd.can_onboard,
            mdjd.satisfaction_score,
+           mdjd.computed_status,
+           mdjd.review_status,
+           ${EFFECTIVE_STATUS_SQL}       AS effective_status,
            mdjd.updated_at               AS last_analysis_at
          FROM merchant_information mi
          ${joinType} merchant_document_json_data mdjd ON mdjd.mid = mi.mid
@@ -1028,6 +1045,9 @@ const fetchMerchantList = async (req, res) => {
            mt.name            AS merchant_type_name,
            mdjd.can_onboard,
            mdjd.satisfaction_score,
+           mdjd.computed_status,
+           mdjd.review_status,
+           ${EFFECTIVE_STATUS_SQL} AS effective_status,
            mdjd.updated_at    AS last_analysis_at
          FROM merchant_information mi
          LEFT JOIN merchant_types mt ON mt.id = mi.merchant_type_id
@@ -1047,6 +1067,9 @@ const fetchMerchantList = async (req, res) => {
           merchant_type_name: local.merchant_type_name || null,
           can_onboard:        local.can_onboard        != null ? local.can_onboard : null,
           satisfaction_score: local.satisfaction_score != null ? local.satisfaction_score : null,
+          computed_status:    local.computed_status    || null,
+          review_status:      local.review_status      || null,
+          effective_status:   local.effective_status   || null,
           last_analysis_at:   local.last_analysis_at   || null,
           onboarded_date:     local.onboarded_date     || m.onboarded_date || null,
         };
@@ -1181,7 +1204,10 @@ const getDashboardStats = async (req, res) => {
         SUM(CASE WHEN mdjd.can_onboard IS NOT NULL                                     THEN 1 ELSE 0 END) AS analyzed,
         SUM(CASE WHEN mdjd.mid IS NULL OR mdjd.can_onboard IS NULL                     THEN 1 ELSE 0 END) AS remaining,
         SUM(CASE WHEN mdjd.satisfaction_score >= 50                                    THEN 1 ELSE 0 END) AS above50,
-        SUM(CASE WHEN mdjd.satisfaction_score IS NOT NULL AND mdjd.satisfaction_score < 50 THEN 1 ELSE 0 END) AS below50
+        SUM(CASE WHEN mdjd.satisfaction_score IS NOT NULL AND mdjd.satisfaction_score < 50 THEN 1 ELSE 0 END) AS below50,
+        SUM(CASE WHEN COALESCE(mdjd.review_status, mdjd.computed_status) = 'verified'  THEN 1 ELSE 0 END) AS verified,
+        SUM(CASE WHEN COALESCE(mdjd.review_status, mdjd.computed_status) = 'caution'   THEN 1 ELSE 0 END) AS caution,
+        SUM(CASE WHEN COALESCE(mdjd.review_status, mdjd.computed_status) IN ('review','review_required') THEN 1 ELSE 0 END) AS review
       FROM merchant_information mi
       LEFT JOIN merchant_document_json_data mdjd ON mdjd.mid = mi.mid
     `);
@@ -1191,6 +1217,9 @@ const getDashboardStats = async (req, res) => {
       remaining: Number(stats.remaining) || 0,
       above50:   Number(stats.above50)   || 0,
       below50:   Number(stats.below50)   || 0,
+      verified:  Number(stats.verified)  || 0,
+      caution:   Number(stats.caution)   || 0,
+      review:    Number(stats.review)    || 0,
     });
   } catch (err) {
     console.error('getDashboardStats error:', err);
@@ -1220,6 +1249,55 @@ const deleteRuleOverride = async (req, res) => {
   }
 };
 
+// Manually set (or clear) a human review status for a merchant. This overrides
+// the system-computed verdict for display/filtering — e.g. a reviewer can mark a
+// blocked merchant "verified" after manually confirming it, or downgrade a clean
+// one to "caution". Pass review_status: 'auto' (or null) to revert to the computed status.
+const updateReviewStatus = async (req, res) => {
+  const { mid } = req.params;
+  let reviewStatus = req.body ? req.body.review_status : undefined;
+  if (!mid) return res.status(400).json({ message: 'MID is required.' });
+
+  if (reviewStatus === null || reviewStatus === '' || reviewStatus === 'auto' || reviewStatus === undefined) {
+    reviewStatus = null; // clear override → fall back to computed_status
+  } else {
+    reviewStatus = String(reviewStatus).toLowerCase();
+    if (reviewStatus === 'review_required') reviewStatus = 'review';
+    if (!['verified', 'caution', 'review'].includes(reviewStatus)) {
+      return res.status(400).json({ message: "Invalid status. Use 'verified', 'caution', 'review', or 'auto' to clear." });
+    }
+  }
+
+  try {
+    const [rows] = await db.query(
+      `SELECT id, computed_status FROM merchant_document_json_data WHERE mid = ? ORDER BY created_at DESC LIMIT 1`,
+      [mid]
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ message: 'No analysis record for this merchant yet. Run analysis first.' });
+    }
+    const by = req.user?.email || req.user?.username || req.user?.id || null;
+    await db.query(
+      `UPDATE merchant_document_json_data
+       SET review_status = ?, review_status_by = ?, review_status_at = ${reviewStatus ? 'NOW()' : 'NULL'}
+       WHERE id = ?`,
+      [reviewStatus, reviewStatus ? by : null, rows[0].id]
+    );
+
+    const effective = reviewStatus || rows[0].computed_status || 'review_required';
+    return res.json({
+      mid,
+      review_status:    reviewStatus,
+      computed_status:  rows[0].computed_status || null,
+      effective_status: effective,
+      can_onboard:      (effective === 'verified' || effective === 'caution') ? 1 : 0,
+    });
+  } catch (err) {
+    console.error('updateReviewStatus error:', err);
+    return res.status(500).json({ message: 'Server error.' });
+  }
+};
+
 module.exports = {
   getRequirements, getAllMerchants, saveMerchant,
   uploadDocument, uploadUrl, getDocuments,
@@ -1229,4 +1307,5 @@ module.exports = {
   triggerAutoRun, getAutoRunStatusHandler,
   getAiUsage, downloadMerchantDocuments, fetchMerchantList, getDashboardStats,
   getRuleOverrides, saveRuleOverride, deleteRuleOverride,
+  updateReviewStatus,
 };
