@@ -1071,6 +1071,18 @@ const isFalseFutureDateIssue = (row = {}) => {
   return Boolean(match && !isDateActuallyFuture(match[0]));
 };
 
+// A "faulty document" note that is NOT a validity failure: duplicates and
+// out-of-scope/not-required uploads mean a valid document already exists (or the
+// extra file simply isn't needed). These must never invalidate a required
+// document or block onboarding — e.g. WebXPay exposes the same bank statement
+// under both `signup_document` and `bank_account`, so it always appears twice.
+const isNonBlockingDocumentFault = (reason = '') => {
+  const r = String(reason).toLowerCase();
+  return /\bduplicate\b/.test(r)
+    || /already\s+(been\s+)?(provided|submitted|uploaded|supplied)/.test(r)
+    || /not\s+required|out[-\s]of[-\s]scope|not\s+applicable|not\s+needed|irrelevant/.test(r);
+};
+
 // ── Onboarding severity policy ─────────────────────────────────────────────
 // Configured with the business: ONLY these categories block onboarding —
 //   1. A MANDATORY document is missing or invalid (this includes required
@@ -2665,6 +2677,9 @@ const buildVerificationReport = ({
       const reason = fault.Reason || fault.reason || fault.issue || '';
       if (isAoAAttestationDateIssue({ document: documentName, field: documentName, reason })) return;
       if (isFalseFutureDateIssue({ document: documentName, field: documentName, reason })) return;
+      // Duplicate / out-of-scope uploads are not validity failures — a valid copy
+      // already satisfies the requirement, so they must not invalidate or block it.
+      if (isNonBlockingDocumentFault(reason)) return;
 
       const key = normalizeDocName(documentName);
       if (!key) return;

@@ -12,6 +12,7 @@ function Documents() {
 
   const [selected, setSelected] = useState(null);
   const [downloading, setDownloading] = useState(false);
+  const [reportDownloading, setReportDownloading] = useState(false);
   const [dlError, setDlError] = useState('');
   const [dlSuccess, setDlSuccess] = useState('');
 
@@ -93,13 +94,56 @@ function Documents() {
     }
   };
 
+  // Download the per-merchant verification report as a Word (.docx) file.
+  const handleDownloadReport = async () => {
+    if (!selected) return;
+    setReportDownloading(true);
+    setDlError('');
+    setDlSuccess('');
+
+    try {
+      const mid = selected.id;
+      const response = await api.get(
+        `/onboard-verification/download-report/${encodeURIComponent(mid)}`,
+        { responseType: 'blob' }
+      );
+
+      const blob = new Blob([response.data], {
+        type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const safeName = String(selected.doing_business_name || `merchant_${mid}`)
+        .replace(/[^a-z0-9]+/gi, '_').replace(/^_+|_+$/g, '').slice(0, 60) || `merchant_${mid}`;
+      a.href = url;
+      a.download = `${safeName}_verification_report.docx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+
+      setDlSuccess(`Downloaded verification report for "${selected.doing_business_name}".`);
+    } catch (err) {
+      let msg = 'Report download failed.';
+      if (err.response) {
+        try {
+          const text = await err.response.data.text();
+          msg = JSON.parse(text).message || msg;
+        } catch { msg = `Error ${err.response.status}`; }
+      }
+      setDlError(msg);
+    } finally {
+      setReportDownloading(false);
+    }
+  };
+
   const totalPages = meta ? meta.last_page : 1;
 
   return (
     <PageLayout title="Documents">
       <div className="page-header">
         <h1 className="page-title">Merchant Documents</h1>
-        <p className="page-subtitle">Search and select a merchant to download all their documents as a PDF.</p>
+        <p className="page-subtitle">Search and select a merchant to download all their documents as a PDF, or a Word verification report.</p>
       </div>
 
       <div className="docs-layout">
@@ -197,7 +241,7 @@ function Documents() {
               <button
                 className="btn btn-primary docs-download-btn"
                 onClick={handleDownload}
-                disabled={downloading}
+                disabled={downloading || reportDownloading}
               >
                 {downloading ? (
                   <><span className="docs-spinner" />Downloading…</>
@@ -209,6 +253,28 @@ function Documents() {
                       <line x1="12" y1="15" x2="12" y2="3"/>
                     </svg>
                     Download PDF
+                  </>
+                )}
+              </button>
+
+              <button
+                className="btn btn-secondary docs-download-btn"
+                style={{ marginTop: 10 }}
+                onClick={handleDownloadReport}
+                disabled={downloading || reportDownloading}
+                title="Download a Word report describing the verification result, issues and onboarding decision for this merchant"
+              >
+                {reportDownloading ? (
+                  <><span className="docs-spinner docs-spinner--dark" />Generating…</>
+                ) : (
+                  <>
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                      <polyline points="14 2 14 8 20 8"/>
+                      <line x1="9" y1="13" x2="15" y2="13"/>
+                      <line x1="9" y1="17" x2="13" y2="17"/>
+                    </svg>
+                    Download Verification Report
                   </>
                 )}
               </button>

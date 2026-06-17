@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const fetch = require('node-fetch');
 const { buildVerificationReport, patchReportCompatibleMismatches } = require('../services/verificationEngine');
+const { buildVerificationReportDoc } = require('../services/reportDocBuilder');
 const { analyzeDocuments, verifyCrossDocumentMismatches } = require('../services/documentAnalyzer');
 const { getUsage, getRemainingBudget } = require('../services/costTracker');
 
@@ -1150,6 +1151,72 @@ const downloadMerchantDocuments = async (req, res) => {
   }
 };
 
+// Generate a Word (.docx) verification report for one merchant: the onboarding
+// decision, rule checks, document validity, issues + clarity comments, and any
+// manual overrides. Does NOT include the merchant's source documents.
+const downloadVerificationReport = async (req, res) => {
+  const { mid } = req.params;
+  if (!mid) return res.status(400).json({ message: 'MID is required.' });
+
+  try {
+    const [rows] = await db.query(
+      `SELECT validation_json, can_onboard, satisfaction_score,
+              computed_status, review_status, review_status_by, review_status_at,
+              created_at, updated_at
+       FROM merchant_document_json_data
+       WHERE mid = ?
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [mid]
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ message: 'No verification analysis found for this merchant. Run analysis first.' });
+    }
+
+    const analysis = rows[0];
+    let report = analysis.validation_json;
+    if (typeof report === 'string') {
+      try { report = JSON.parse(report); } catch { report = {}; }
+    }
+    report = report && typeof report === 'object' ? report : {};
+
+    const [[merchant]] = await db.query(
+      `SELECT mi.mid, mi.merchant_business_name, mi.merchant_channel, mi.onboarded_date,
+              mt.name AS merchant_type_name
+       FROM merchant_information mi
+       LEFT JOIN merchant_types mt ON mt.id = mi.merchant_type_id
+       WHERE mi.mid = ?`,
+      [mid]
+    );
+
+    const [overrides] = await db.query(
+      `SELECT rule_check_name, field_name, document_source, comment
+       FROM merchant_rule_overrides WHERE mid = ? ORDER BY created_at`,
+      [mid]
+    );
+
+    const buffer = await buildVerificationReportDoc({
+      merchant: merchant || { mid },
+      analysis,
+      report,
+      overrides: overrides || [],
+    });
+
+    const safeName = String((merchant && merchant.merchant_business_name) || `merchant_${mid}`)
+      .replace(/[^a-z0-9]+/gi, '_').replace(/^_+|_+$/g, '').slice(0, 60) || `merchant_${mid}`;
+
+    res.set({
+      'Content-Type': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'Content-Disposition': `attachment; filename="${safeName}_verification_report.docx"`,
+      'Content-Length': buffer.length,
+    });
+    return res.send(buffer);
+  } catch (err) {
+    console.error('downloadVerificationReport error:', err);
+    return res.status(500).json({ message: err.message || 'Failed to generate report.' });
+  }
+};
+
 const getRuleOverrides = async (req, res) => {
   const { mid } = req.params;
   try {
@@ -1307,5 +1374,5 @@ module.exports = {
   triggerAutoRun, getAutoRunStatusHandler,
   getAiUsage, downloadMerchantDocuments, fetchMerchantList, getDashboardStats,
   getRuleOverrides, saveRuleOverride, deleteRuleOverride,
-  updateReviewStatus,
+  updateReviewStatus, downloadVerificationReport,
 };
