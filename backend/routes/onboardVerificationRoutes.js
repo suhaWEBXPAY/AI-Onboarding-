@@ -12,7 +12,10 @@ const {
   triggerAutoRun, getAutoRunStatusHandler,
   downloadMerchantDocuments, fetchMerchantList, getDashboardStats,
   getRuleOverrides, saveRuleOverride, deleteRuleOverride,
-  updateReviewStatus, downloadVerificationReport,
+  updateReviewStatus, downloadVerificationReport, downloadAllIssuesReport,
+  getDuplicateStakeholders, getDuplicateStakeholdersForMid,
+  getStakeholderAlertDismissals, saveStakeholderAlertDismissal, deleteStakeholderAlertDismissal,
+  getExtractionCorrections, saveExtractionCorrection, deleteExtractionCorrection,
 } = require('../controllers/onboardVerificationController');
 
 const upload = multer({
@@ -44,11 +47,20 @@ router.post('/auto-run',                   protect, triggerAutoRun);
 router.get('/auto-run-status',             protect, getAutoRunStatusHandler);
 router.get('/download-documents/:mid',     protect, downloadMerchantDocuments);
 router.get('/download-report/:mid',        protect, downloadVerificationReport);
+router.get('/download-issues-report',      protect, downloadAllIssuesReport);
 router.get('/merchant-list',               protect, fetchMerchantList);
 router.get('/dashboard-stats',             protect, getDashboardStats);
 router.get('/rule-overrides/:mid',         protect, getRuleOverrides);
 router.post('/rule-overrides',             protect, saveRuleOverride);
 router.delete('/rule-overrides/:id',       protect, deleteRuleOverride);
 router.patch('/review-status/:mid',        protect, updateReviewStatus);
+router.get('/duplicate-stakeholders',      protect, getDuplicateStakeholders);
+router.get('/duplicate-stakeholders/:mid', protect, getDuplicateStakeholdersForMid);
+router.get('/stakeholder-alert-dismissals',        protect, getStakeholderAlertDismissals);
+router.post('/stakeholder-alert-dismissals',       protect, saveStakeholderAlertDismissal);
+router.delete('/stakeholder-alert-dismissals/:id', protect, deleteStakeholderAlertDismissal);
+router.get('/extraction-corrections/:mid',    protect, getExtractionCorrections);
+router.post('/extraction-corrections',        protect, saveExtractionCorrection);
+router.delete('/extraction-corrections/:id',  protect, deleteExtractionCorrection);
 
 module.exports = router;

@@ -196,6 +196,28 @@ const buildVerificationReportDoc = async ({ merchant = {}, analysis = {}, report
     ], { spacing: { before: 100, after: 100 } }));
   }
 
+  // Decision justification — per-issue evidence, policy rule, and remediation.
+  const decision = report.onboardingDecision;
+  if (decision?.summary) {
+    blocks.push(heading('Decision Justification'));
+    blocks.push(para([new TextRun({ text: decision.summary, size: 20, color: COLOR.ink })]));
+    if (Array.isArray(decision.blockingIssues) && decision.blockingIssues.length) {
+      blocks.push(buildTable(
+        ['#', 'Blocking Issue', 'Evidence / Reason', 'Required Action'],
+        decision.blockingIssues.map((issue, i) => [
+          { value: String(i + 1), bold: true },
+          { value: issue.title || issue.field || '—', bold: true, color: COLOR.red },
+          `${issue.reason || '—'}${issue.policy ? `\n${issue.policy}` : ''}`,
+          issue.requiredAction || '—',
+        ]),
+        [5, 25, 42, 28]
+      ));
+    }
+    if (decision.policyNote) {
+      blocks.push(para([new TextRun({ text: decision.policyNote, size: 16, color: COLOR.grey, italics: true })], { spacing: { before: 80 } }));
+    }
+  }
+
   // Rule checks
   if (ruleChecks.length) {
     blocks.push(heading('Verification Rule Checks'));
@@ -294,4 +316,234 @@ const buildVerificationReportDoc = async ({ merchant = {}, analysis = {}, report
   return Packer.toBuffer(doc);
 };
 
-module.exports = { buildVerificationReportDoc };
+// ── consolidated issues report ────────────────────────────────────────────────
+
+// Strip internal/technical phrasing from stored analysis text so the report
+// reads in plain language (no "LABEL:", "Google AI", "external system API").
+const cleanDocName = (s) => String(s || '').replace(/^\s*label\s*:\s*/i, '').trim();
+
+const humanize = (raw) => {
+  if (!raw) return '';
+  let t = String(raw);
+  // "the document (LABEL: Bank Confirmation Letter)" → "the Bank Confirmation Letter"
+  t = t.replace(/the document \(label:\s*([^)]+)\)/gi, 'the $1');
+  t = t.replace(/\(label:\s*([^)]+)\)/gi, '($1)');
+  // Internal source names → plain words.
+  t = t.replace(/google ai document value does not match the external system api value\.?/gi, '');
+  t = t.replace(/google ai document value/gi, 'the value in the uploaded document');
+  t = t.replace(/the external system api value/gi, 'the system record');
+  t = t.replace(/external system api/gi, 'system record');
+  t = t.replace(/^needs review:\s*/i, '');
+  // 'Bank Branch — "Bank Branch" does not match…' → 'Bank Branch does not match…'
+  t = t.replace(/([A-Za-z][\w\s/&-]{1,50}?)\s*[—-]\s*[""']\1[""']\s*/gi, '$1 ');
+  // Tidy leftover spacing/punctuation from the removals above.
+  t = t.replace(/\s{2,}/g, ' ').replace(/\s+([.,;:])/g, '$1').replace(/[—-]\s*$/, '').trim();
+  if (t && !/[.!?]$/.test(t)) t += '.';
+  return t;
+};
+
+// Collect every open, actionable issue for one merchant from its stored report,
+// worded for a non-technical reader. Missing OPTIONAL documents are returned
+// separately (they are informational, not problems to fix). Manually ignored
+// failures are excluded.
+const collectMerchantIssues = (report = {}, overrides = []) => {
+  const issues = [];
+  const optionalMissing = [];
+  const isIgnored = (field, docName) => overrides.some(
+    (ov) => (ov.field_name || '') === (field || '') && (ov.document_source || '') === (docName || '—')
+  );
+
+  // 1. Missing / invalid documents.
+  const documentChecks = Array.isArray(report.documentChecks) ? report.documentChecks : [];
+  for (const d of documentChecks) {
+    const name = cleanDocName(d.name) || 'Document';
+    if (!d.present) {
+      if (!d.isMandatory) { optionalMissing.push(name); continue; }
+      issues.push({
+        type: 'Missing document',
+        blocking: true,
+        detail: `The ${name} has not been uploaded. It is required for onboarding.`,
+        action: `Upload the ${name}.`,
+      });
+    } else if (d.valid === false) {
+      const reasons = (d.issues || [])
+        .map((i) => humanize(i.field ? `${i.field}: ${i.reason}` : i.reason)).filter(Boolean).join(' ');
+      issues.push({
+        type: 'Document problem',
+        blocking: Boolean(d.isMandatory),
+        detail: `There is a problem with the ${name}.${reasons ? ` ${reasons}` : ''}`,
+        action: `Fix the problem and upload the corrected ${name}.`,
+      });
+    }
+  }
+
+  // 2. Blocking issues from the onboarding decision (already carry an action).
+  const blockingIssues = Array.isArray(report.onboardingDecision?.blockingIssues)
+    ? report.onboardingDecision.blockingIssues : [];
+  const coveredFields = new Set();
+  for (const b of blockingIssues) {
+    const key = String(b.field || b.title || '').trim().toLowerCase();
+    if (key) coveredFields.add(key);
+    issues.push({
+      type: 'Must fix',
+      blocking: true,
+      detail: humanize(`${b.title || b.field || 'Issue'}${b.reason ? ` — ${b.reason}` : ''}`),
+      action: humanize(b.requiredAction) || '—',
+    });
+  }
+
+  // 3. Field-level data issues (skip ones already covered by a blocking issue).
+  const rows = (Array.isArray(report.unifiedRows) ? report.unifiedRows : [])
+    .filter((r) => ['missing', 'mismatch', 'invalid'].includes(r.status));
+  for (const r of rows) {
+    if (isIgnored(r.field, r.document)) continue;
+    if (coveredFields.has(String(r.field || '').trim().toLowerCase())) continue;
+    const docName = cleanDocName(r.document);
+    const where = docName && docName !== '—' ? ` in the ${docName}` : '';
+    const comment = humanize(r.comment);
+    const byStatus = {
+      missing: {
+        type: 'Missing information',
+        detail: `"${r.field}" could not be found${where || ' in the submitted documents'}.`,
+        action: `Provide the ${r.field} — upload a document that shows it.`,
+      },
+      mismatch: {
+        type: 'Information mismatch',
+        detail: `"${r.field}"${where ? ` (${docName})` : ''} does not match across sources.`,
+        action: `Check which ${r.field} is correct, then update the document or the system record so they match.`,
+      },
+      invalid: {
+        type: 'Incorrect information',
+        detail: `"${r.field}"${where} appears to be incorrect.`,
+        action: `Correct the ${r.field}${where} and re-upload the document.`,
+      },
+    };
+    const base = byStatus[r.status];
+    issues.push({
+      type: base.type,
+      blocking: r.status !== 'mismatch',
+      detail: comment ? `${base.detail} ${comment}` : base.detail,
+      action: base.action,
+    });
+  }
+
+  return { issues, optionalMissing };
+};
+
+// One combined Word report covering every analyzed merchant: a summary table,
+// then a section per merchant listing each open issue and the action needed to
+// resolve it. `entries` = [{ merchant, analysis, report, overrides }].
+const buildAllIssuesReportDoc = async (entries = []) => {
+  const prepared = entries.map((e) => {
+    const effective = normStatus(e.analysis?.review_status)
+      || normStatus(e.analysis?.computed_status)
+      || normStatus(e.report?.status) || 'review';
+    const { issues, optionalMissing } = collectMerchantIssues(e.report, e.overrides || []);
+    return {
+      merchant: e.merchant || {},
+      analysis: e.analysis || {},
+      status: effective,
+      issues,
+      optionalMissing,
+    };
+  });
+
+  const withIssues = prepared.filter((p) => p.issues.length);
+  const clean = prepared.filter((p) => !p.issues.length);
+  const totalIssues = withIssues.reduce((n, p) => n + p.issues.length, 0);
+
+  const blocks = [];
+
+  // Title
+  blocks.push(new Paragraph({
+    spacing: { after: 40 },
+    children: [new TextRun({ text: 'Consolidated Merchant Issues Report', bold: true, size: 36, color: COLOR.ink })],
+  }));
+  blocks.push(new Paragraph({
+    spacing: { after: 200 },
+    children: [new TextRun({
+      text: `Generated ${fmtDate(new Date())} — covers ${prepared.length} analyzed merchant(s), ${withIssues.length} with open issues (${totalIssues} issue(s) total).`,
+      size: 18, color: COLOR.grey, italics: true,
+    })],
+  }));
+
+  // Summary table across all analyzed merchants
+  blocks.push(heading('Summary — All Analyzed Merchants'));
+  blocks.push(buildTable(
+    ['Merchant', 'MID', 'Status', 'Open Issues', 'Last Analyzed'],
+    prepared.map((p) => {
+      const meta = STATUS_META[p.status];
+      return [
+        p.merchant.merchant_business_name || '—',
+        safe(p.merchant.mid || p.analysis.mid),
+        { value: meta.label, bold: true, color: meta.color },
+        { value: String(p.issues.length), bold: p.issues.length > 0, color: p.issues.length ? COLOR.red : COLOR.green },
+        fmtDate(p.analysis.updated_at || p.analysis.created_at),
+      ];
+    }),
+    [32, 14, 16, 12, 26]
+  ));
+
+  // Per-merchant issue sections
+  for (const p of withIssues) {
+    const meta = STATUS_META[p.status];
+    const name = p.merchant.merchant_business_name || `Merchant ${safe(p.merchant.mid || p.analysis.mid)}`;
+    blocks.push(heading(`${name} (MID ${safe(p.merchant.mid || p.analysis.mid)})`));
+    blocks.push(para([
+      new TextRun({ text: 'Status: ', bold: true, size: 20, color: COLOR.ink }),
+      new TextRun({ text: meta.label, bold: true, size: 20, color: meta.color }),
+      new TextRun({ text: `   ${meta.blurb}`, size: 18, color: COLOR.grey, italics: true }),
+    ]));
+    blocks.push(buildTable(
+      ['#', 'What is wrong', 'How to fix it'],
+      p.issues.map((iss, i) => [
+        { value: String(i + 1), bold: true },
+        [
+          new TextRun({ text: `${iss.type}: `, bold: true, size: 20, color: iss.blocking ? COLOR.red : COLOR.amber }),
+          new TextRun({ text: iss.detail, size: 20, color: COLOR.ink }),
+        ],
+        { value: iss.action, color: COLOR.blue },
+      ]),
+      [5, 55, 40]
+    ));
+    if (p.optionalMissing.length) {
+      blocks.push(para([new TextRun({
+        text: `Optional documents not provided (do not block onboarding): ${p.optionalMissing.join(', ')}.`,
+        size: 18, color: COLOR.grey, italics: true,
+      })], { spacing: { before: 80 } }));
+    }
+  }
+
+  // Merchants with no open issues
+  if (clean.length) {
+    blocks.push(heading('Merchants With No Open Issues'));
+    blocks.push(para([new TextRun({
+      text: clean.map((p) => `${p.merchant.merchant_business_name || 'Merchant'} (${safe(p.merchant.mid || p.analysis.mid)})`).join('  •  '),
+      size: 20, color: COLOR.green,
+    })]));
+  }
+
+  // Footer
+  blocks.push(new Paragraph({
+    spacing: { before: 320 },
+    border: { top: { style: BorderStyle.SINGLE, size: 4, color: COLOR.line } },
+    children: [new TextRun({
+      text: 'This report was generated automatically from the latest stored verification analysis of each merchant. Manually ignored failures are excluded from the issue lists.',
+      size: 16, color: COLOR.grey, italics: true,
+    })],
+  }));
+
+  const doc = new Document({
+    creator: 'AI-Onboarding-V2',
+    title: 'Consolidated Merchant Issues Report',
+    styles: { default: { document: { run: { font: 'Calibri', color: COLOR.ink } } } },
+    sections: [{
+      properties: { page: { margin: { top: 720, bottom: 720, left: 720, right: 720 } } },
+      children: blocks,
+    }],
+  });
+
+  return Packer.toBuffer(doc);
+};
+
+module.exports = { buildVerificationReportDoc, buildAllIssuesReportDoc };

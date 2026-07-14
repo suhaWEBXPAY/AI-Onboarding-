@@ -13,6 +13,8 @@ function Documents() {
   const [selected, setSelected] = useState(null);
   const [downloading, setDownloading] = useState(false);
   const [reportDownloading, setReportDownloading] = useState(false);
+  const [issuesReportDownloading, setIssuesReportDownloading] = useState(false);
+  const [issuesReportError, setIssuesReportError] = useState('');
   const [dlError, setDlError] = useState('');
   const [dlSuccess, setDlSuccess] = useState('');
 
@@ -137,13 +139,81 @@ function Documents() {
     }
   };
 
+  // Download one combined Word report listing every analyzed merchant's open
+  // issues and the actions needed to resolve them (e.g. which document to upload).
+  const handleDownloadIssuesReport = async () => {
+    setIssuesReportDownloading(true);
+    setIssuesReportError('');
+
+    try {
+      const response = await api.get(
+        '/onboard-verification/download-issues-report',
+        { responseType: 'blob' }
+      );
+
+      const blob = new Blob([response.data], {
+        type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `merchant_issues_report_${new Date().toISOString().slice(0, 10)}.docx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      let msg = 'Issues report download failed.';
+      if (err.response) {
+        try {
+          const text = await err.response.data.text();
+          msg = JSON.parse(text).message || msg;
+        } catch { msg = `Error ${err.response.status}`; }
+      }
+      setIssuesReportError(msg);
+    } finally {
+      setIssuesReportDownloading(false);
+    }
+  };
+
   const totalPages = meta ? meta.last_page : 1;
 
   return (
     <PageLayout title="Documents">
-      <div className="page-header">
-        <h1 className="page-title">Merchant Documents</h1>
-        <p className="page-subtitle">Search and select a merchant to download all their documents as a PDF, or a Word verification report.</p>
+      <div className="page-header" style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 16, flexWrap: 'wrap' }}>
+        <div>
+          <h1 className="page-title">Merchant Documents</h1>
+          <p className="page-subtitle">Search and select a merchant to download all their documents as a PDF, or a Word verification report.</p>
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
+          <button
+            className="btn btn-primary"
+            onClick={handleDownloadIssuesReport}
+            disabled={issuesReportDownloading}
+            title="Download one Word report covering every analyzed merchant: each open issue and the action needed to resolve it (e.g. which missing document to upload)"
+          >
+            {issuesReportDownloading ? (
+              <><span className="docs-spinner" />Generating…</>
+            ) : (
+              <>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                  <polyline points="7 10 12 15 17 10"/>
+                  <line x1="12" y1="15" x2="12" y2="3"/>
+                </svg>
+                {' '}Download All Issues Report
+              </>
+            )}
+          </button>
+          {issuesReportError && (
+            <div className="docs-feedback docs-feedback--error">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+              </svg>
+              {issuesReportError}
+            </div>
+          )}
+        </div>
       </div>
 
       <div className="docs-layout">

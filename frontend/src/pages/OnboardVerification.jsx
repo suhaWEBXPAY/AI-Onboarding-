@@ -6,6 +6,16 @@ const FORM_INIT = { mid: '', merchant_channel: 'IPG', merchant_type_id: '' };
 
 const WEBXPAY_TYPE_KEYWORDS = { 1: 'private', 2: 'proprietor', 3: 'partnership', 4: 'society', 5: 'individual' };
 
+const getMerchantNameFromSystemData = (systemData) => {
+  const biz = systemData?.data?.business_information || {};
+  return [
+    biz.name_of_company_business,
+    biz.registered_name_of_business,
+    biz.business_name,
+    biz.company_name,
+  ].find((value) => String(value || '').trim()) || '';
+};
+
 const asPrettyJson = (value) => JSON.stringify(value, null, 2);
 
 const coerceJsonValue = (value) => {
@@ -77,6 +87,97 @@ const parseBold = (text) => {
 const fmtDate = (value) => value
   ? new Date(value).toLocaleString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })
   : '-';
+
+const normalizeDecisionKey = (value) => String(value ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
+const sameDecisionTarget = (leftField, leftDocument, rightField, rightDocument) => {
+  const lf = normalizeDecisionKey(leftField);
+  const rf = normalizeDecisionKey(rightField);
+  const ld = normalizeDecisionKey(leftDocument);
+  const rd = normalizeDecisionKey(rightDocument);
+  if (!lf || !rf || lf !== rf) return false;
+  if (!ld || !rd) return true;
+  return ld === rd || ld.includes(rd) || rd.includes(ld);
+};
+
+const issueHasManualResolution = (issue, overrides = [], corrections = []) => {
+  const field = issue.field || issue.title || '';
+  const document = issue.document || '';
+  return overrides.some((ov) => sameDecisionTarget(field, document, ov.field_name, ov.document_source))
+    || corrections.some((corr) => sameDecisionTarget(field, document, corr.field_name, corr.document_source));
+};
+
+const buildEffectiveDecision = (report, overrides = [], corrections = []) => {
+  const decision = report?.onboardingDecision;
+  if (!decision) return null;
+  const originalBlocking = decision.blockingIssues || [];
+  if (originalBlocking.length === 0) return decision;
+
+  const remainingBlocking = originalBlocking.filter(
+    (issue) => !issueHasManualResolution(issue, overrides, corrections)
+  );
+  const resolvedCount = originalBlocking.length - remainingBlocking.length;
+  if (resolvedCount === 0) return decision;
+
+  if (remainingBlocking.length === 0) {
+    return {
+      ...decision,
+      canOnboard: true,
+      outcome: 'eligible',
+      headline: 'Eligible for onboarding',
+      summary: `${resolvedCount} blocking issue(s) were resolved or ignored with reviewer action. This merchant is now eligible for onboarding based on the effective review state.`,
+      blockingIssues: [],
+      nextSteps: [],
+      resolvedCount,
+      effectiveReviewApplied: true,
+    };
+  }
+
+  return {
+    ...decision,
+    canOnboard: false,
+    outcome: 'blocked',
+    headline: 'Onboarding blocked',
+    summary: `Onboarding is still blocked by ${remainingBlocking.length} issue(s). ${resolvedCount} issue(s) were resolved or ignored with reviewer action.`,
+    blockingIssues: remainingBlocking,
+    nextSteps: [...new Set(remainingBlocking.map((issue) => issue.requiredAction).filter(Boolean))],
+    resolvedCount,
+    effectiveReviewApplied: true,
+  };
+};
+
+const labelForEffectiveStatus = (status) => (
+  status === 'verified' ? 'Verified'
+    : status === 'caution' ? 'Caution'
+      : status === 'review_required' ? 'Review required'
+        : status
+);
+
+const applyEffectiveDecisionToReport = (report, overrides = [], corrections = []) => {
+  if (!report) return report;
+  const decision = buildEffectiveDecision(report, overrides, corrections);
+  if (!decision) return report;
+  const status = decision.canOnboard ? 'verified' : (report.status || 'review_required');
+  const blockingCount = decision.blockingIssues?.length || 0;
+  return {
+    ...report,
+    status,
+    statusLabel: labelForEffectiveStatus(status),
+    blockingCount,
+    onboardingDecision: decision,
+    ruleChecks: (report.ruleChecks || []).map((check) => (
+      check.isVerdict
+        ? {
+          ...check,
+          status: decision.canOnboard ? 'pass' : 'fail',
+          detail: decision.canOnboard
+            ? 'Eligible for onboarding after reviewer fixes/ignores.'
+            : decision.summary,
+        }
+        : check
+    )),
+  };
+};
 
 function StatusPill({ status, label }) {
   return (
@@ -222,6 +323,16 @@ const getSolution = (item, ruleKey) => {
 
 const getRuleItems = (check, report) => {
   if (!report) return [];
+  if (check.isVerdict) {
+    return (report.onboardingDecision?.blockingIssues || []).map((issue) => ({
+      field:    issue.field,
+      document: issue.document || '—',
+      aiValue:  issue.documentValue || '—',
+      apiValue: issue.systemValue || '—',
+      comment:  `${issue.reason}${issue.policy ? ` ${issue.policy}` : ''}`,
+      solution: issue.requiredAction,
+    }));
+  }
   const rows = report.unifiedRows || [];
   const key = RULE_STATUS_MAP[check.name];
   if (key === 'missing') {
@@ -440,9 +551,83 @@ function DataPanel({ title, subtitle, iconBg, icon, value, onChange, loading, em
   );
 }
 
-function UnifiedTable({ rows = [], allDocuments = [] }) {
+// Inline editor for one AI-extracted value — used when the AI misreads a value
+// and the reviewer corrects it manually. Corrections persist in the DB, survive
+// refresh and re-extraction, and re-verification updates the eligibility score.
+function AiValueCell({ row, correction, onSave, onUndo }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const startEdit = () => {
+    setDraft(row.aiValue && row.aiValue !== '—' && row.aiValue !== '(not found)' ? String(row.aiValue) : '');
+    setEditing(true);
+  };
+
+  const save = async () => {
+    if (!draft.trim() || busy) return;
+    setBusy(true);
+    await onSave(row, draft.trim());
+    setBusy(false);
+    setEditing(false);
+  };
+
+  // The editor floats over the table (absolute popover) so opening/cancelling
+  // never reflows the columns.
+  return (
+    <td className="td-value">
+      <div className="ai-value-cell">
+        <span>{formatCell(row.aiValue)}</span>
+        {editing && (
+          <div className="ai-edit-popover">
+            <div className="ai-edit-popover-title">Correct “{row.field}”</div>
+            <input
+              className="rule-override-comment-input"
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') { e.preventDefault(); save(); }
+                if (e.key === 'Escape') setEditing(false);
+              }}
+              placeholder="Correct value…"
+              autoFocus
+            />
+            <div className="ai-value-edit-hint">AI read: {formatCell(row.aiValue)}</div>
+            <div className="rule-override-input-actions">
+              <button type="button" className="rule-override-confirm-btn" onClick={save} disabled={!draft.trim() || busy}>
+                {busy ? 'Saving…' : 'Save'}
+              </button>
+              <button type="button" className="rule-override-cancel-btn" onClick={() => setEditing(false)}>Cancel</button>
+            </div>
+          </div>
+        )}
+        {!editing && (correction ? (
+          <span
+            className="ai-value-corrected"
+            title={`Manually corrected${correction.corrected_by ? ` by ${correction.corrected_by}` : ''}${correction.old_value ? ` — AI originally read: ${correction.old_value}` : ''}`}
+          >
+            ✎ edited
+            <button type="button" className="ai-value-undo" onClick={() => onUndo(correction)} title="Undo this correction and restore the AI value">
+              Undo
+            </button>
+          </span>
+        ) : (
+          <button type="button" className="ai-value-edit-btn" onClick={startEdit} title="Correct this AI-extracted value manually">
+            ✎
+          </button>
+        ))}
+      </div>
+    </td>
+  );
+}
+
+function UnifiedTable({ rows = [], allDocuments = [], corrections = [], onSaveCorrection, onDeleteCorrection }) {
   const [filter, setFilter] = useState('all');
   const [viewerDoc, setViewerDoc] = useState(null);
+
+  const correctionFor = (row) => corrections.find(
+    (c) => c.field_name === (row.field || '') && (c.document_source || '') === (row.document || '')
+  ) || null;
   const filtered = filter === 'all' ? rows : rows.filter((r) => r.status === filter);
   const counts = FILTER_OPTIONS.reduce((acc, opt) => {
     acc[opt.key] = opt.key === 'all' ? rows.length : rows.filter((r) => r.status === opt.key).length;
@@ -507,7 +692,9 @@ function UnifiedTable({ rows = [], allDocuments = [] }) {
                       )}
                     </div>
                   </td>
-                  <td className="td-value">{formatCell(row.aiValue)}</td>
+                  {onSaveCorrection
+                    ? <AiValueCell row={row} correction={correctionFor(row)} onSave={onSaveCorrection} onUndo={onDeleteCorrection} />
+                    : <td className="td-value">{formatCell(row.aiValue)}</td>}
                   <td className="td-value">{formatCell(row.apiValue)}</td>
                   <td>
                     <span className={`unified-status-badge unified-status-badge--${cfg.tone}`}>
@@ -569,6 +756,8 @@ export default function OnboardVerification() {
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState({ text: '', type: '' });
   const [overrides, setOverrides] = useState([]);
+  const [corrections, setCorrections] = useState([]);
+  const [merchantName, setMerchantName] = useState('');
 
   const loadOverrides = useCallback(async (mid) => {
     if (!mid) { setOverrides([]); return; }
@@ -577,6 +766,16 @@ export default function OnboardVerification() {
       setOverrides(res.data || []);
     } catch {
       setOverrides([]);
+    }
+  }, []);
+
+  const loadCorrections = useCallback(async (mid) => {
+    if (!mid) { setCorrections([]); return; }
+    try {
+      const res = await api.get(`/onboard-verification/extraction-corrections/${encodeURIComponent(mid)}`);
+      setCorrections(Array.isArray(res.data) ? res.data : []);
+    } catch {
+      setCorrections([]);
     }
   }, []);
 
@@ -601,6 +800,99 @@ export default function OnboardVerification() {
     }
   }, [form.mid]);
 
+  // Patch a value into the currently displayed result rows so the UI updates
+  // instantly; the authoritative re-verification runs in the background.
+  const patchResultRow = (row, newAiValue) => {
+    setResult((prev) => {
+      if (!prev) return prev;
+      const patch = (r) => (
+        r.field === (row.field || '') && (r.document || '') === (row.document || '')
+          ? { ...r, aiValue: newAiValue }
+          : r
+      );
+      return { ...prev, unifiedRows: (prev.unifiedRows || []).map(patch) };
+    });
+  };
+
+  // Background re-verification: prefers the fast /verify-data path using the
+  // payloads already loaded on this page (no WebXPay round-trip); falls back to
+  // the full /verify-mid run. Not awaited by the editor — saving feels instant.
+  const reverifyInBackground = async () => {
+    const mid = form.mid.trim();
+    setLoading(true);
+    try {
+      let documentData = null;
+      let systemData = null;
+      try {
+        documentData = parseJson(documentJson, 'Google AI document extraction data');
+        systemData = parseJson(systemJson, 'External system API data');
+      } catch { /* fall back to verify-mid */ }
+
+      if (documentData && systemData && form.merchant_type_id) {
+        const response = await api.post('/onboard-verification/verify-data', {
+          mid: mid || null,
+          merchant_type_id: form.merchant_type_id,
+          merchant_channel: form.merchant_channel,
+          documentData,
+          systemData,
+        });
+        setResult(response.data);
+      } else if (mid) {
+        const response = await api.post(`/onboard-verification/verify-mid/${encodeURIComponent(mid)}`, {
+          merchant_type_id: form.merchant_type_id || undefined,
+          merchant_channel: form.merchant_channel,
+        });
+        setResult(response.data.report);
+        setDocumentJson(asPrettyJson(response.data.documentData));
+        setSystemJson(asPrettyJson(response.data.systemData));
+        setMerchantName(getMerchantNameFromSystemData(response.data.systemData));
+      }
+      setMessage({ text: 'Results and eligibility score updated.', type: 'success' });
+    } catch (err) {
+      setMessage({ text: err.response?.data?.message || 'Re-verification failed — click Run Verification to refresh.', type: 'error' });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Save a manual correction of an AI value. The correction persists in the DB
+  // (survives refresh AND re-extraction); the row updates instantly and the
+  // eligibility score recomputes when the background re-verification lands.
+  const handleSaveCorrection = async (row, newValue) => {
+    const mid = form.mid.trim();
+    if (!mid) { setMessage({ text: 'A MID is required to save corrections.', type: 'error' }); return; }
+    try {
+      const { data } = await api.post('/onboard-verification/extraction-corrections', {
+        mid,
+        field_name: row.field || '',
+        document_source: row.document || '',
+        old_value: row.aiValue === '—' ? null : row.aiValue,
+        new_value: newValue,
+      });
+      setCorrections(Array.isArray(data) ? data : []);
+      patchResultRow(row, newValue);
+      setMessage({ text: `"${row.field}" corrected — updating results in the background…`, type: 'success' });
+      reverifyInBackground();
+    } catch (err) {
+      setMessage({ text: err.response?.data?.message || 'Failed to save correction.', type: 'error' });
+    }
+  };
+
+  const handleDeleteCorrection = async (correction) => {
+    const mid = form.mid.trim();
+    try {
+      const { data } = await api.delete(`/onboard-verification/extraction-corrections/${correction.id}?mid=${encodeURIComponent(mid)}`);
+      setCorrections(Array.isArray(data) ? data : []);
+      if (correction.old_value != null) {
+        patchResultRow({ field: correction.field_name, document: correction.document_source }, correction.old_value);
+      }
+      setMessage({ text: 'Correction removed — restoring the AI value in the background…', type: 'success' });
+      reverifyInBackground();
+    } catch (err) {
+      setMessage({ text: err.response?.data?.message || 'Failed to remove correction.', type: 'error' });
+    }
+  };
+
   useEffect(() => {
     api.get('/merchant-types')
       .then((res) => setMerchantTypes(res.data))
@@ -611,6 +903,11 @@ export default function OnboardVerification() {
   const selectedMerchantType = useMemo(
     () => merchantTypes.find((type) => String(type.id) === String(form.merchant_type_id)),
     [merchantTypes, form.merchant_type_id]
+  );
+
+  const effectiveResult = useMemo(
+    () => applyEffectiveDecisionToReport(result, overrides, corrections),
+    [result, overrides, corrections]
   );
 
   const handleRunVerification = async (event) => {
@@ -638,6 +935,7 @@ export default function OnboardVerification() {
         systemData,
       });
       setResult(response.data);
+      setMerchantName(getMerchantNameFromSystemData(systemData));
       setMessage({ text: 'Verification completed.', type: 'success' });
     } catch (err) {
       setMessage({ text: err.response?.data?.message || 'Verification failed.', type: 'error' });
@@ -653,17 +951,21 @@ export default function OnboardVerification() {
     setMessage({ text: '', type: '' });
     setAutoFilled(false);
     setOverrides([]);
+    setCorrections([]);
+    setMerchantName('');
   };
 
   const fetchAllForMid = async (mid) => {
     if (!mid) { setMessage({ text: 'Enter a MID to load data.', type: 'error' }); return; }
     setMessage({ text: '', type: '' });
+    setMerchantName('');
     setFetchingDoc(true);
     setFetchingSys(true);
 
-    const [docResult, sysResult] = await Promise.allSettled([
+    const [docResult, sysResult, merchantResult] = await Promise.allSettled([
       api.get(`/onboard-verification/latest-analysis/${encodeURIComponent(mid)}`),
       api.get(`/onboard-verification/external-merchant/${encodeURIComponent(mid)}`),
+      api.get(`/onboard-verification/merchant/${encodeURIComponent(mid)}`),
     ]);
 
     if (docResult.status === 'fulfilled') {
@@ -682,6 +984,7 @@ export default function OnboardVerification() {
     if (sysResult.status === 'fulfilled') {
       const sysData = sysResult.value.data;
       setSystemJson(asPrettyJson(sysData));
+      setMerchantName(getMerchantNameFromSystemData(sysData));
       const typeId = sysData?.data?.business_type?.type_of_business_id;
       const keyword = WEBXPAY_TYPE_KEYWORDS[Number(typeId)];
       const matchedType = keyword ? merchantTypes.find((t) => t.name.toLowerCase().includes(keyword)) : null;
@@ -699,10 +1002,16 @@ export default function OnboardVerification() {
     }
     setFetchingSys(false);
 
+    if (merchantResult.status === 'fulfilled') {
+      const localName = merchantResult.value.data?.merchant_business_name || '';
+      setMerchantName((current) => current || localName);
+    }
+
     if (docResult.status === 'fulfilled' && sysResult.status === 'fulfilled') {
       setMessage({ text: `Data loaded for MID ${mid}.`, type: 'success' });
     }
     loadOverrides(mid);
+    loadCorrections(mid);
   };
 
   const handleMidKeyDown = (event) => {
@@ -731,6 +1040,7 @@ export default function OnboardVerification() {
       setSystemJson(asPrettyJson(response.data.systemData));
       setResult(response.data.report);
       const sysData = response.data.systemData;
+      setMerchantName(getMerchantNameFromSystemData(sysData));
       const typeId = sysData?.data?.business_type?.type_of_business_id;
       const keyword = WEBXPAY_TYPE_KEYWORDS[Number(typeId)];
       const matchedType = keyword ? merchantTypes.find((t) => t.name.toLowerCase().includes(keyword)) : null;
@@ -741,6 +1051,7 @@ export default function OnboardVerification() {
       setAutoFilled(true);
       setMessage({ text: 'Google AI document analysis and API verification complete.', type: 'success' });
       loadOverrides(mid);
+      loadCorrections(mid);
     } catch (err) {
       const serverMsg = err.response?.data?.message;
       const httpStatus = err.response?.status ? ` (HTTP ${err.response.status})` : '';
@@ -802,7 +1113,7 @@ export default function OnboardVerification() {
               <h1 className="page-title">Merchant Data Verification</h1>
               <p className="page-subtitle">Use Google AI to extract and validate API documents, then compare them against external system API data.</p>
             </div>
-            <StatusPill status={result?.status} label={result?.statusLabel} />
+            <StatusPill status={effectiveResult?.status} label={effectiveResult?.statusLabel} />
           </div>
 
           {/* ── Verification Inputs card ── */}
@@ -843,7 +1154,7 @@ export default function OnboardVerification() {
                         <input
                           className="form-control vi-input-has-icon"
                           value={form.mid}
-                          onChange={(e) => { setForm({ ...form, mid: e.target.value }); setAutoFilled(false); }}
+                          onChange={(e) => { setForm({ ...form, mid: e.target.value }); setAutoFilled(false); setMerchantName(''); }}
                           onBlur={handleMidBlur}
                           onKeyDown={handleMidKeyDown}
                           placeholder="Enter MID and press Enter"
@@ -863,6 +1174,12 @@ export default function OnboardVerification() {
                         {(fetchingDoc || fetchingSys) ? 'Loading…' : 'Load Data'}
                       </button>
                     </div>
+                    {merchantName && (
+                      <div className="vi-merchant-name">
+                        <span className="vi-merchant-name-label">Merchant</span>
+                        <span className="vi-merchant-name-value">{merchantName}</span>
+                      </div>
+                    )}
                   </div>
                   <div className="form-group">
                     <label className="form-label">Merchant Channel</label>
@@ -1015,12 +1332,12 @@ export default function OnboardVerification() {
           </div>
 
           {/* ── Results ── */}
-          {result && (
+          {effectiveResult && (
             <>
               <div className="card">
                 <div className="card-header">
                   <span className="card-title"><span className="card-title-accent" />Verification Summary</span>
-                  <span className="card-badge">{fmtDate(result.generatedAt)}</span>
+                  <span className="card-badge">{fmtDate(effectiveResult.generatedAt)}</span>
                 </div>
                 <div className="verification-summary">
                   {satisfactionScore !== null && (
@@ -1037,8 +1354,8 @@ export default function OnboardVerification() {
                 </div>
               </div>
               <RuleChecks
-                checks={result.ruleChecks}
-                report={result}
+                checks={effectiveResult.ruleChecks}
+                report={effectiveResult}
                 allDocuments={allDocuments}
                 mid={form.mid.trim() || null}
                 overrides={overrides}
@@ -1046,13 +1363,16 @@ export default function OnboardVerification() {
                 onDeleteOverride={handleDeleteOverride}
               />
               <UnifiedTable
-                rows={(result.unifiedRows || []).filter((row) => {
+                rows={(effectiveResult.unifiedRows || []).filter((row) => {
                   if (!['missing', 'mismatch', 'invalid'].includes(row.status)) return true;
                   return !overrides.some(
                     (ov) => ov.field_name === (row.field || '') && ov.document_source === (row.document || '—')
                   );
                 })}
                 allDocuments={allDocuments}
+                corrections={corrections}
+                onSaveCorrection={handleSaveCorrection}
+                onDeleteCorrection={handleDeleteCorrection}
               />
             </>
           )}

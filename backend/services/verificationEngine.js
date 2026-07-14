@@ -75,7 +75,10 @@ const SYSTEM_SKIP_CANONICAL = new Set([
   // invalid system date placeholder (0000-00-00)
   'visaexpirydate',
   // duplicate/internal address fields
-  'streetaddressbusiness', 'cityidbusiness', 'zipcodebusiness',
+  // NOTE: street_address_business is intentionally NOT skipped — it is the true
+  // counterpart for a document's "Business Address" (street_address is the
+  // owner's legal/home address and produced false mismatches).
+  'cityidbusiness', 'zipcodebusiness',
 ]);
 
 const DOC_LIST_KEYS = [
@@ -270,6 +273,12 @@ const FIELD_ALIAS_GROUPS = [
     'driving license number',
     'driving_licence_number',
     'driving licence number',
+    'driver_license_number',
+    'driver license number',
+    'driver_licence_number',
+    'driver licence number',
+    'dl_number',
+    'dl number',
   ],
   [
     'name',           // stakeholders[n].name in WebXPay — full name stored here
@@ -357,11 +366,19 @@ const FIELD_ALIAS_LOOKUP = FIELD_ALIAS_GROUPS.reduce((lookup, group) => {
 
 const normalizeDocName = (value = '') => String(value)
   .toLowerCase()
+  // Underscores are word characters, so \b-anchored replacements below never fire
+  // inside labels like "upload_nat_business_doc" — split separators first.
+  .replace(/[_-]+/g, ' ')
+  // WebXPay label abbreviation: "upload nat business doc" = Nature of Business document
+  .replace(/\bnat\b/g, 'nature')
   .replace(/\bbrc\b/g, 'business registration certificate')
   .replace(/\bnic\b/g, 'national identity card')
   .replace(/\bdl\b/g, 'driving licence')
   .replace(/\bdriver'?s?\s+license\b/g, 'driving licence')
   .replace(/\bdriving\s+license\b/g, 'driving licence')
+  .replace(/\bthree\s+month\s+bank\s+statement\b/g, 'bank statement')
+  .replace(/\bbank\s+(account\s+)?confirmation(\s+letter)?\b/g, 'bank statement')
+  .replace(/\bbank\s+letter\b/g, 'bank statement')
   .replace(/\bid\s*copy\b/g, 'identity document')
   .replace(/\bid\s*copies\b/g, 'identity document')
   .replace(/\bnational\s+identity\s+card\b/g, 'identity document')
@@ -396,9 +413,19 @@ const isPlainObject = (value) => (
   && !(value instanceof Date)
 );
 
+// Placeholder strings the AI emits for absent values — treated as blank so they
+// are never compared, matched, or format-validated as real data.
+const NA_PLACEHOLDERS = new Set([
+  'na', 'notapplicable', 'notavailable', 'notfound', 'none', 'null', 'unreadable', 'unknown',
+]);
+
 const isBlank = (value) => {
   if (value === undefined || value === null) return true;
-  if (typeof value === 'string') return value.trim() === '';
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (trimmed === '' || trimmed === '-') return true;
+    return NA_PLACEHOLDERS.has(trimmed.toLowerCase().replace(/[^a-z]/g, ''));
+  }
   if (Array.isArray(value)) return value.length === 0;
   if (isPlainObject(value)) return Object.keys(value).length === 0;
   return false;
@@ -418,26 +445,80 @@ const sentence = (value = '') => {
   return /[.!?]$/.test(text) ? text : `${text}.`;
 };
 
+// Sri Lankan NIC: old format is 9 digits + V/X (e.g. 640453060V); new format is
+// 12 digits (e.g. 196404503060). They map 1:1 — the same person carries both,
+// and a single ID card prints the new number on the front and the old on the
+// back. Convert old → new so a document quoting one format matches a source
+// quoting the other.  old YY DDD SSS C  ->  new 19YY DDD 0SSS
+const oldNicToNew = (d9) => `19${d9.slice(0, 5)}0${d9.slice(5)}`;
+
 const normalizeIdentityToken = (value = '') => {
   const cleaned = String(value || '').replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
-  return cleaned.length === 13 && /^\d{12}[vx]$/.test(cleaned)
-    ? cleaned.slice(0, 12)
-    : cleaned;
+  // New-format 12-digit NIC that picked up a trailing V/X from OCR.
+  if (cleaned.length === 13 && /^\d{12}[vx]$/.test(cleaned)) return cleaned.slice(0, 12);
+  // AI hybrid: century prefix glued onto the OLD format ("19" + 9 digits + V,
+  // e.g. 19740240013V) — canonicalise like an old NIC with that century.
+  const hybrid = cleaned.match(/^(19|20)(\d{9})[vx]$/);
+  if (hybrid) return `${hybrid[1]}${hybrid[2].slice(0, 5)}0${hybrid[2].slice(5)}`;
+  // Old 9-digit + V/X format → canonical new 12-digit form.
+  if (/^\d{9}[vx]$/.test(cleaned)) return oldNicToNew(cleaned.slice(0, 9));
+  return cleaned;
 };
 
-const extractIdentityTokens = (value = '') => {
+const STRICT_IDENTITY_TOKEN_RE = /\b(?:[A-Z]{1,3}\d{6,9}|\d{9}\s*[VX]|\d{11}[VX]|\d{12}[VX]?)\b/g;
+const LOOSE_IDENTITY_TOKEN_RE = /\b(?:[A-Z]{1,3}\d{5,10}|\d{9}\s*[VX]|\d{11}[VX]|\d{12}[VX]?|\d{6,10})\b/g;
+
+const extractIdentityTokens = (value = '', options = {}) => {
   const text = String(value || '').toUpperCase();
-  const matches = text.match(/\b(?:[A-Z]{1,3}\d{6,9}|\d{9}[VX]|\d{12}[VX]?)\b/g) || [];
+  // Tolerate a space before the old-format check letter ("640453060 V").
+  // \d{11}[VX] catches the AI's hybrid "century + old format" form.
+  // In explicit identity contexts, also accept numeric passport / driving
+  // licence values such as UK passport number "129384735".
+  const matches = text.match(options.loose ? LOOSE_IDENTITY_TOKEN_RE : STRICT_IDENTITY_TOKEN_RE) || [];
   return [...new Set(matches.map(normalizeIdentityToken).filter(Boolean))];
 };
 
+const isIdentityValueContext = (...parts) => {
+  const raw = parts.map((part) => String(part || '')).join(' ');
+  const key = normalizeKey(raw);
+  const partKeys = parts.map((part) => normalizeKey(part || '')).filter(Boolean);
+  const docName = normalizeDocName(raw);
+  return partKeys.some((partKey) => isIdentityComparisonContext(partKey))
+    || isIdentityComparisonContext(key)
+    || docName.includes('identity document')
+    || docName.includes('passport')
+    || docName.includes('driving licence')
+    || /\b(dl|licen[cs]e)\b/i.test(raw);
+};
+
+const extractIdentityTokensForContext = (value, ...contextParts) => extractIdentityTokens(value, {
+  loose: isIdentityValueContext(...contextParts),
+});
+
+// True when a free-text reason cites two or more distinct NIC/identity
+// representations that all resolve to the SAME canonical identity — i.e. the
+// "mismatch" is only an old-vs-new NIC format difference, not a real conflict.
+const isPureIdentityFormatMismatch = (text = '') => {
+  const raw = String(text || '').toUpperCase().match(STRICT_IDENTITY_TOKEN_RE) || [];
+  const distinctRaw = new Set(raw.map((t) => t.replace(/\s/g, '')));
+  if (distinctRaw.size < 2) return false;
+  const canonical = new Set([...distinctRaw].map(normalizeIdentityToken).filter(Boolean));
+  return canonical.size === 1;
+};
+
 const isValidNicToken = (value) => /^(\d{9}[vx]|\d{12})$/.test(normalizeIdentityToken(value));
-const isValidPassportToken = (value) => /^[a-z]{1,3}\d{6,9}$/.test(normalizeIdentityToken(value));
-const isValidIdentityToken = (value) => isValidNicToken(value) || isValidPassportToken(value);
+const isValidPassportToken = (value) => /^([a-z]{1,3}\d{5,10}|\d{6,10})$/.test(normalizeIdentityToken(value));
+const isValidDrivingLicenseToken = (value) => (
+  /^[a-z0-9]{6,12}$/.test(normalizeIdentityToken(value)) && !isValidNicToken(value)
+);
+const isValidIdentityToken = (value) => (
+  isValidNicToken(value) || isValidPassportToken(value) || isValidDrivingLicenseToken(value)
+);
 
 const identityTokenType = (value) => {
   if (isValidNicToken(value)) return 'nic';
   if (isValidPassportToken(value)) return 'passport';
+  if (isValidDrivingLicenseToken(value)) return 'driving_license';
   return null;
 };
 
@@ -446,8 +527,8 @@ const identityTypesIn = (value = '') => new Set(
 );
 
 const hasCrossTypeIdentityPair = (left = '', right = '') => {
-  const leftTokens = extractIdentityTokens(left);
-  const rightTokens = extractIdentityTokens(right);
+  const leftTokens = extractIdentityTokens(left, { loose: true });
+  const rightTokens = extractIdentityTokens(right, { loose: true });
   if (!leftTokens.length || !rightTokens.length) return false;
   if (leftTokens.some((token) => rightTokens.includes(token))) return false;
 
@@ -469,6 +550,9 @@ const isIdentityComparisonContext = (key = '') => (
   || key.includes('nationalidentity')
   || key.includes('drivinglicense')
   || key.includes('drivinglicence')
+  || key.includes('driverlicense')
+  || key.includes('driverlicence')
+  || key.includes('dlnumber')
   || key.includes('idnumber')
   || key.includes('stakeholderid')
   || key === 'id'
@@ -698,15 +782,21 @@ const tokenizeDocName = (value) => {
     'and',
     'for',
     'with',
+    'of',
     'copy',
     'certified',
     'valid',
     'latest',
     'document',
     'documents',
+    'doc',
+    'docs',
+    'upload',
+    'uploaded',
     'proof',
     'letter',
     'form',
+    'declaration',
   ]);
 
   return normalizeDocName(value)
@@ -802,12 +892,28 @@ const comparisonAliasesFor = (...values) => {
 
 const aliasesForRow = (row) => comparisonAliasesFor(row?.field, row?.label, row?.path);
 
+// Aliases for prompt-coverage system lookups: alias-group expansion is applied to
+// the FIELD and SECTION only. The document label and API source are appended as
+// raw tokens without expansion — expanding them poisoned lookups: an ID-document
+// field with apiSource "NIC" (e.g. Age, Gender, Date of Birth) inherited the whole
+// identity alias group and "matched" the stakeholder's NIC number as its system value.
+const promptComparisonAliases = ({ field, section, documentName, apiSource }) => {
+  const aliases = new Set(comparisonAliasesFor(field, section));
+  [documentName, apiSource].forEach((value) => {
+    const normalized = normalizeKey(value || '');
+    if (normalized) aliases.add(normalized);
+  });
+  return [...aliases];
+};
+
 const stripTrailingIndex = (value = '') => String(value).replace(/\d+$/, '');
 
 const sourceLabelForRow = (row) => {
   const firstPathSegment = String(row?.path || '').split('.')[0];
   return firstPathSegment ? humanizeKey(firstPathSegment) : (row?.document || 'System record');
 };
+
+const MONTH_NAME_RE = /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b/i;
 
 const parseDateValue = (value) => {
   if (value instanceof Date && !Number.isNaN(value.getTime())) return value;
@@ -820,14 +926,22 @@ const parseDateValue = (value) => {
     return Number.isNaN(date.getTime()) ? null : date;
   }
 
-  const slash = text.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/);
-  if (slash) {
-    const date = new Date(Number(slash[3]), Number(slash[2]) - 1, Number(slash[1]));
+  // Sri Lankan documents use slash, dash, AND dotted separators (27.02.2031).
+  const dmy = text.match(/^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})$/);
+  if (dmy) {
+    const date = new Date(Number(dmy[3]), Number(dmy[2]) - 1, Number(dmy[1]));
     return Number.isNaN(date.getTime()) ? null : date;
   }
 
+  // Last resort: only trust the JS date parser for strings that plainly look
+  // like dates (contain a month name). V8's lenient parser reads junk like
+  // "WU 10537" as year 10537 and "8760" as year 8760, which corrupted
+  // registration-number comparisons into garbage ISO dates.
+  if (!MONTH_NAME_RE.test(text)) return null;
   const date = new Date(text);
-  return Number.isNaN(date.getTime()) ? null : date;
+  if (Number.isNaN(date.getTime())) return null;
+  const year = date.getFullYear();
+  return year >= 1900 && year <= 2100 ? date : null;
 };
 
 const normalizeComparable = (value) => {
@@ -838,6 +952,9 @@ const normalizeComparable = (value) => {
     .toLowerCase()
     .trim()
     .replace(/\bheadquarters\b/g, 'head office')
+    // Colombo place-name synonyms: the same suburb has an English/colonial name
+    // and a Sinhala name — bank branches use them interchangeably.
+    .replace(/\bcolpetty\b/g, 'kollupitiya')
     .replace(/[.,/#!$%^&*;:{}=\-_`~()]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -944,8 +1061,8 @@ const valuesEqual = (left, right, context = '') => {
   const key = normalizeKey(context);
 
   if (isIdentityComparisonContext(key)) {
-    const leftIds = extractIdentityTokens(left);
-    const rightIds = extractIdentityTokens(right);
+    const leftIds = extractIdentityTokens(left, { loose: true });
+    const rightIds = extractIdentityTokens(right, { loose: true });
     if (leftIds.length && rightIds.length && leftIds.some((id) => rightIds.includes(id))) {
       return true;
     }
@@ -1008,8 +1125,14 @@ const valuesEqual = (left, right, context = '') => {
   return false;
 };
 
+const DATE_SHAPE_RE = /^\s*(\d{4}-\d{2}-\d{2}|\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4})\s*$/;
+
 const valuesNearMatch = (left, right) => {
   if (isBlank(left) || isBlank(right)) return false;
+  // Two values that are both dates either match exactly (valuesEqual) or they
+  // are DIFFERENT dates — token similarity must never soft-match them
+  // (2008-10-18 vs 2018-10-15 previously near-matched on shared tokens).
+  if (DATE_SHAPE_RE.test(String(left)) && DATE_SHAPE_RE.test(String(right))) return false;
   const leftNorm = normalizeComparable(left);
   const rightNorm = normalizeComparable(right);
   if (leftNorm.includes(rightNorm) || rightNorm.includes(leftNorm)) return true;
@@ -1083,6 +1206,103 @@ const isNonBlockingDocumentFault = (reason = '') => {
     || /not\s+required|out[-\s]of[-\s]scope|not\s+applicable|not\s+needed|irrelevant/.test(r);
 };
 
+// Bank-statement recency is admin-review only (onboarding matrix §7: bank
+// statements have no document-level expiry). A statement older than N months
+// must never invalidate the document or block onboarding.
+const isBankStatementRecencyIssue = (row = {}) => {
+  const docText = normalizeDocName(`${row.document || ''} ${row.section || ''} ${row.field || ''}`);
+  const isBankDoc = docText.includes('bank statement')
+    || docText.includes('bank confirmation')
+    || normalizeKey(row.field || '').includes('statementdate');
+  if (!isBankDoc) return false;
+  const text = normalizeComparable(`${row.reason || ''} ${row.rule || ''}`);
+  return /\b(month|months|prior|older|recent|current|recency|stale|outdated|latest|expired)\b/.test(text)
+    && /\b(statement|date|dated)\b/.test(text);
+};
+
+const documentCheckIssueRow = (check = {}, issue = {}) => ({
+  document: check.name || check.document || issue.document || '',
+  section: check.name || issue.section || '',
+  field: issue.field || check.name || '',
+  reason: issue.reason || '',
+  rule: issue.reason || '',
+});
+
+const hasBlockingDocumentIssues = (check = {}) => {
+  if (!check.present) return true;
+  if (check.valid !== false) return false;
+  const issues = Array.isArray(check.issues) ? check.issues : [];
+  if (!issues.length) return true;
+  return issues.some((issue) => {
+    const row = documentCheckIssueRow(check, issue);
+    return !isBankStatementRecencyIssue(row)
+      && !isBankCustomerAddressIssue(row)
+      && !isAcceptedBankDocumentLabelSwap(row.reason);
+  });
+};
+
+const isBrcOwnerNicPromptGap = ({ section, field, documentName, reason } = {}) => {
+  const sectionNorm = normalizeKey(section || '');
+  const fieldNorm = normalizeKey(field || '');
+  const docNorm = normalizeDocName(documentName || '');
+  const reasonNorm = normalizeComparable(reason || '');
+  const isOwnerNicField = fieldNorm === 'ownernic'
+    || fieldNorm === 'proprietornic'
+    || (fieldNorm.includes('owner') && fieldNorm.includes('nic'));
+  const isBrcContext = sectionNorm === 'businessregistration'
+    || docNorm.includes('business registration certificate')
+    || docNorm === 'brc';
+  if (!isOwnerNicField || !isBrcContext) return false;
+
+  // The BRC can verify the owner/proprietor by name; it does not have to carry
+  // the owner's NIC number. Do not suppress a real value mismatch if one exists.
+  return !/\b(mismatch|does not match|differs|invalid|inconsistent)\b/.test(reasonNorm);
+};
+
+const isBrcOwnerNicMissingIssue = (row = {}) => {
+  if (!isBrcOwnerNicPromptGap({
+    section: row.section,
+    field: row.field,
+    documentName: row.document || row.documentName,
+    reason: `${row.reason || ''} ${row.rule || ''}`,
+  })) return false;
+
+  const text = normalizeComparable(`${row.reason || ''} ${row.rule || ''} ${row.documentValue || ''} ${row.value || ''}`);
+  return row.category === 'prompt_field_comparison'
+    || row.category === 'ai_missing_field'
+    || /\b(missing|not found|notfound|absent|unclear|not captured|was not found|provide)\b/.test(text);
+};
+
+const isNonBlockingCriticalFieldIssue = (row = {}) => (
+  isBankStatementRecencyIssue(row) || isBrcOwnerNicMissingIssue(row)
+);
+
+// A label/content "mismatch" where BOTH the expected label and the found
+// content are identity documents (e.g. "expected ID Copy, found Passport") is
+// NOT a fault: the ID slot accepts NIC, passport, or driving licence
+// interchangeably — the prompt tells the AI to determine the exact type from
+// the content. Only cross-category swaps (bank statement in the ID slot, a
+// letter in the license slot) are real label faults.
+const isIdentityLabelContentSwap = (reason = '') => {
+  const text = String(reason).toLowerCase();
+  if (!/(does not match label|mislabel|expected)/.test(text)) return false;
+  // Any non-identity document category named in the reason → genuine fault.
+  if (/\b(bank|statement|registration certificate|license|licence|resolution|articles|form \d|agreement|utility|letter)\b/.test(text)) return false;
+  const identityWords = ['passport', 'nic', 'driving licen', 'id copy', 'id copies', 'identity'];
+  const hits = identityWords.filter((word) => text.includes(word));
+  return hits.length >= 2;
+};
+
+const isAcceptedBankDocumentLabelSwap = (reason = '') => {
+  const text = normalizeComparable(reason || '');
+  if (!/(does not match label|mislabel|expected)/.test(text)) return false;
+  const expectedBankStatement = /\bexpected\b.*\bbank\b.*\bstatement\b/.test(text)
+    || /\bexpected\b.*\bthree\s+month\b.*\bstatement\b/.test(text);
+  const foundBankConfirmation = /\bfound\b.*\bbank\b.*\b(confirmation|letter|statement)\b/.test(text)
+    || /\bfound\b.*\bconfirmation\s+letter\b/.test(text);
+  return expectedBankStatement && foundBankConfirmation;
+};
+
 // ── Onboarding severity policy ─────────────────────────────────────────────
 // Configured with the business: ONLY these categories block onboarding —
 //   1. A MANDATORY document is missing or invalid (this includes required
@@ -1092,11 +1312,18 @@ const isNonBlockingDocumentFault = (reason = '') => {
 // Everything else (other field mismatches, source-only gaps, non-mandatory
 // document/field gaps) is a MINOR issue: the merchant may still be onboarded,
 // but is flagged "caution" for a human to glance at.
-const BANK_FIELD_RE = /\b(bank|a\/?c|account\s*(no|number|name|holder)?|branch|swift|iban|ifsc|sort\s*code|routing)\b/i;
+// Only the fields that actually identify the account block onboarding (account
+// number, account holder/customer name, bank name, branch, routing codes).
+// Secondary bank-statement fields (currency, statement date, customer address)
+// are matched separately below and are non-blocking.
+const BANK_FIELD_RE = /\b(bank\s*name|bank\s*branch|branch(\s*name)?|a\/?c|account\s*(no|number|name|holder(\s*name)?)?|customer\s*name|swift|iban|ifsc|sort\s*code|routing)\b/i;
 const IDENTITY_FIELD_RE = /\b(nic\b|national\s*id|identity\s*card|passport|driving\s*licen[cs]e|\bdl\b|full\s*name|holder\s*name|name\s*of\s*(the\s*)?(director|stakeholder|signatory|individual|proprietor|partner|owner)|director\s*name|signatory\s*name)\b/i;
 
 const issueHaystack = (row = {}) => `${row.field || ''} ${row.document || ''}`;
-const isBankIssueRow = (row) => BANK_FIELD_RE.test(issueHaystack(row));
+// Bank matching is field-name-only: matching the document label too (e.g. any
+// field on a "Bank Statement" document) caused unrelated fields like Currency or
+// Customer Address to be misclassified as blocking bank-detail issues.
+const isBankIssueRow = (row) => BANK_FIELD_RE.test(row.field || '');
 const isIdentityIssueRow = (row) => IDENTITY_FIELD_RE.test(issueHaystack(row));
 // Whole-document categories are already represented by documentChecks; only
 // field-level rows are considered for the bank/identity critical filter so we
@@ -1118,13 +1345,14 @@ const classifyOnboardingSeverity = ({
   documentChecks = [],
 }) => {
   const mandatoryDocGaps = documentChecks.filter(
-    (c) => c.isMandatory && (!c.present || c.valid === false)
+    (c) => c.isMandatory && !c.waived && (!c.present || hasBlockingDocumentIssues(c))
   );
   const missingMandatory = mandatoryDocGaps.filter((c) => !c.present);
-  const invalidMandatory = mandatoryDocGaps.filter((c) => c.present && c.valid === false);
+  const invalidMandatory = mandatoryDocGaps.filter((c) => c.present && hasBlockingDocumentIssues(c));
 
   const criticalFieldIssues = [...missingData, ...invalidData, ...mismatches]
     .filter(isFieldLevelRow)
+    .filter((row) => !isNonBlockingCriticalFieldIssue(row))
     .filter((row) => isBankIssueRow(row) || isIdentityIssueRow(row));
   const bankIssues = criticalFieldIssues.filter(isBankIssueRow);
   const identityIssues = criticalFieldIssues.filter((r) => !isBankIssueRow(r) && isIdentityIssueRow(r));
@@ -1149,6 +1377,170 @@ const classifyOnboardingSeverity = ({
   return { status, blockingCount, blockingReasons, mandatoryDocGaps, criticalFieldIssues };
 };
 
+// Human-readable statements of the three configured blocking policy rules,
+// cited on every blocking issue so the justification names the exact rule.
+const POLICY_TEXT = {
+  mandatory_document: 'Blocking policy 1: every mandatory document configured for this merchant type must be uploaded and pass validation.',
+  bank: 'Blocking policy 2: bank account details must be present, valid, and consistent between the bank document and the system record.',
+  identity: 'Blocking policy 3: core identity fields (name, NIC, passport, driving licence) must be present, valid, and consistent across all sources.',
+};
+
+// Builds the full onboarding decision: the same verdict as
+// classifyOnboardingSeverity, plus one justified entry per blocking issue
+// (evidence values, the policy rule violated, and the remediation action) and
+// a narrative summary an admin can read as-is.
+const buildOnboardingDecision = ({
+  missingData = [],
+  invalidData = [],
+  mismatches = [],
+  documentOnlyData = [],
+  systemOnlyData = [],
+  documentChecks = [],
+}) => {
+  const severity = classifyOnboardingSeverity({
+    missingData, invalidData, mismatches, documentOnlyData, systemOnlyData, documentChecks,
+  });
+
+  const blockingIssues = [];
+
+  severity.mandatoryDocGaps.forEach((check) => {
+    if (!check.present) {
+      blockingIssues.push({
+        code: 'MANDATORY_DOCUMENT_MISSING',
+        category: 'mandatory_document',
+        title: `Mandatory document missing: ${check.name}`,
+        field: check.name,
+        document: check.name,
+        documentValue: '(not uploaded)',
+        systemValue: '—',
+        reason: `The mandatory document "${check.name}" was not found among the uploaded documents or the AI document extraction.${check.description ? ` ${sentence(check.description)}` : ''}`,
+        policy: POLICY_TEXT.mandatory_document,
+        requiredAction: `Upload a clear, complete and valid copy of "${check.name}".`,
+      });
+      return;
+    }
+
+    const blockingCheckIssues = (check.issues || [])
+      .filter((issue) => {
+        const row = documentCheckIssueRow(check, issue);
+        return !isBankStatementRecencyIssue(row)
+          && !isBankCustomerAddressIssue(row)
+          && !isAcceptedBankDocumentLabelSwap(row.reason);
+      });
+    const issueText = blockingCheckIssues
+      .map((issue) => (issue.field ? `${issue.field}: ${issue.reason}` : issue.reason))
+      .filter(Boolean)
+      .join(' | ') || 'The document failed AI validity checks.';
+    // "Failed to load" means the download from storage timed out during the AI
+    // run — the document itself is fine; asking the merchant to re-upload it
+    // would be the wrong remediation.
+    const isLoadFailure = /failed to load|load failure|download|timed? ?out/i.test(issueText);
+    blockingIssues.push({
+      code: isLoadFailure ? 'MANDATORY_DOCUMENT_UNREADABLE' : 'MANDATORY_DOCUMENT_INVALID',
+      category: 'mandatory_document',
+      title: isLoadFailure
+        ? `Mandatory document could not be analyzed: ${check.name}`
+        : `Mandatory document invalid: ${check.name}`,
+      field: check.name,
+      document: check.name,
+      documentValue: isLoadFailure ? '(uploaded, download failed during analysis)' : '(uploaded, failed validation)',
+      systemValue: '—',
+      reason: isLoadFailure
+        ? `The mandatory document "${check.name}" is uploaded, but its file could not be downloaded during the last AI extraction run (transient storage error) — it was never analyzed. ${sentence(issueText)}`
+        : `The mandatory document "${check.name}" was uploaded but failed validation — ${issueText}`,
+      policy: POLICY_TEXT.mandatory_document,
+      requiredAction: isLoadFailure
+        ? 'Re-run the analysis ("Re-extract Docs") — the document is already uploaded; the previous run hit a temporary download failure.'
+        : `Re-upload a corrected "${check.name}" that resolves: ${issueText}`,
+    });
+  });
+
+  const describeFieldIssue = (row, issueType) => {
+    const docVal = displayValue(row.documentValue ?? row.value);
+    const sysVal = displayValue(row.systemValue);
+    if (issueType === 'mismatch') {
+      return `"${row.field}" does not match between sources: the document (${row.document || 'document extraction'}) shows "${docVal}" while the system record shows "${sysVal}".${row.reason ? ` ${sentence(row.reason)}` : ''}`;
+    }
+    if (issueType === 'invalid') {
+      return `"${row.field}" in ${row.document || 'the submitted data'} has an invalid value (${docVal}). ${sentence(row.rule || row.reason || 'It failed a validity rule.')}`;
+    }
+    return `"${row.field}" is missing from ${row.document || 'the submitted documents'}. ${sentence(row.reason || 'A required value was not found.')}`;
+  };
+
+  const actionForFieldIssue = (row, issueType, category) => {
+    // A field "missing" because the source document failed to download is an
+    // infrastructure error, not a merchant gap — the fix is re-running analysis.
+    if (/failed to load|load failure|timed? ?out/i.test(String(row.reason || row.rule || ''))) {
+      return 'Re-run the analysis ("Re-extract Docs") — the source document is uploaded but could not be downloaded in the last run.';
+    }
+    if (issueType === 'mismatch') {
+      return `Reconcile "${row.field}": confirm which source is correct and update the ${category === 'bank' ? 'bank record or bank document' : 'identity document or system record'} so both agree.`;
+    }
+    if (issueType === 'invalid') {
+      return `Correct "${row.field}" and re-submit the affected document (${row.document || 'source document'}).`;
+    }
+    return `Provide "${row.field}"${row.document ? ` via ${row.document}` : ''} so it can be verified.`;
+  };
+
+  const pushCriticalRows = (rows, issueType) => {
+    rows.filter(isFieldLevelRow).forEach((row) => {
+      if (isNonBlockingCriticalFieldIssue(row)) return;
+      const isBank = isBankIssueRow(row);
+      const isIdentity = !isBank && isIdentityIssueRow(row);
+      if (!isBank && !isIdentity) return;
+      const category = isBank ? 'bank' : 'identity';
+      blockingIssues.push({
+        code: `${isBank ? 'BANK_DETAIL' : 'IDENTITY'}_${issueType.toUpperCase()}`,
+        category,
+        title: `${isBank ? 'Bank detail' : 'Identity'} ${issueType}: ${row.field}`,
+        field: row.field,
+        document: row.document || '—',
+        documentValue: displayValue(row.documentValue ?? row.value),
+        systemValue: displayValue(row.systemValue),
+        reason: describeFieldIssue(row, issueType),
+        policy: POLICY_TEXT[category],
+        requiredAction: actionForFieldIssue(row, issueType, category),
+      });
+    });
+  };
+
+  pushCriticalRows(missingData, 'missing');
+  pushCriticalRows(invalidData, 'invalid');
+  pushCriticalRows(mismatches, 'mismatch');
+
+  const totalFindings = missingData.length + invalidData.length + mismatches.length
+    + documentOnlyData.length + systemOnlyData.length;
+  const nonBlockingCount = Math.max(0, totalFindings - severity.criticalFieldIssues.length);
+
+  const canOnboard = severity.blockingCount === 0;
+  let summary;
+  if (canOnboard) {
+    summary = nonBlockingCount > 0
+      ? `This merchant is eligible for onboarding: all mandatory documents are present and valid, bank account details are consistent, and core identity fields verified successfully. ${nonBlockingCount} minor, non-blocking observation(s) were recorded for reviewer awareness — none fall into a blocking category.`
+      : 'This merchant is eligible for onboarding: all mandatory documents are present and valid, bank account details are consistent, core identity fields verified successfully, and no issues were detected.';
+  } else {
+    const numbered = blockingIssues.map((issue, i) => `(${i + 1}) ${issue.reason}`).join(' ');
+    summary = `Onboarding is blocked by ${blockingIssues.length} issue(s): ${numbered} Each issue must be resolved — or explicitly overridden by a reviewer with a documented reason — before this merchant can be approved.`;
+  }
+
+  const nextSteps = [...new Set(blockingIssues.map((issue) => issue.requiredAction))];
+
+  return {
+    ...severity,
+    decision: {
+      canOnboard,
+      outcome: canOnboard ? 'eligible' : 'blocked',
+      headline: canOnboard ? 'Eligible for onboarding' : 'Onboarding blocked',
+      summary,
+      blockingIssues,
+      blockingCount: severity.blockingCount,
+      nonBlockingCount,
+      nextSteps,
+      policyNote: 'Blocking categories per configured policy: (1) missing or invalid mandatory documents, (2) bank account detail issues, (3) core identity issues. All other findings are minor and non-blocking.',
+    },
+  };
+};
+
 const statusLabelFor = (status) => (
   status === 'verified' ? 'Verified'
     : status === 'caution' ? 'Caution — minor issues only'
@@ -1156,11 +1548,14 @@ const statusLabelFor = (status) => (
         : 'Review required'
 );
 
+// Deliberately excludes registered_name_of_business: trade names routinely contain
+// generic words that collide with regulated-activity keywords (e.g. "THE CAR CLINIC"
+// is an auto shop, not a medical clinic) and would falsely trigger a license
+// requirement. Only actual nature-of-business/category fields are scanned.
 const systemOperationalBusinessText = (systemData = {}) => [
   systemData?.business_information?.nature_of_business,
   systemData?.business_information?.category_code_id,
   systemData?.business_information?.type_of_business,
-  systemData?.business_information?.registered_name_of_business,
 ].filter(Boolean).join(' ');
 
 const searchableText = (value) => {
@@ -1230,21 +1625,48 @@ const documentOperationalBusinessText = (documentData = {}) => {
   };
 };
 
+// Keyword sets aligned with the Laravel onboarding matrix (LicenseSlotDefinitionService).
+// `exclude` phrases are stripped from the text before the pattern is applied — e.g.
+// "car clinic" must not trigger the medical-clinic PHSRC rule (matrix Slot 5).
+// `exception(text)` returning true suppresses the rule after a match.
 const LICENSE_RULES = [
   { license: 'Ayurveda / Homeopathy Council Registration', pattern: /\b(ayurved\w*|homeopath\w*)\b/ },
-  { license: 'PHSRC License', pattern: /\b(clinic|hospital|medical centre|medical center|diagnostic|laborator\w*|healthcare)\b/ },
+  {
+    license: 'PHSRC License',
+    pattern: /\b(clinic|hospital|medical centre|medical center|diagnostic|laborator\w*|healthcare)\b/,
+    exclude: /\b(car|auto|vehicle|automobile|motor)\s+clinics?\b/g,
+  },
   { license: 'NMRA License', pattern: /\b(pharmacy|pharma\w*|pharmaceutical\w*|drug|medicine|medical equipment|medical device|cosmetic\w*|nmra)\b/ },
   { license: 'National Gem & Jewelry Authority License', pattern: /\b(gems?\s+(?:and\s+)?jewel\w*|jewel\w*)\b/ },
-  { license: 'SLTDA License', pattern: /\b(hotel|lodging|travel agent|tour operator|tourism|slt?da)\b/ },
+  {
+    license: 'SLTDA License',
+    pattern: /\b(hotel booking|guest house|visa consultation|tour packages?|tour operator|travel agent|travels?|tourism|sightseeing|cruise|lodging|hospitality|resorts?|accommodation|itinerar\w*|hotel|slt?da)\b/,
+  },
   { license: 'Central Bank Money Changing License', pattern: /\b(money changer|money changers|money changing|foreign currency exchange)\b/ },
-  { license: 'TRCSL License', pattern: /\b(telecom|telecommunication|trcsl)\b/ },
-  { license: 'Civil Aviation License', pattern: /\b(airline|air ticket|ticketing agent|civil aviation)\b/ },
+  { license: 'TRCSL License', pattern: /\b(telecom\w*|trcsl)\b/ },
+  { license: 'Civil Aviation License', pattern: /\b(airline|air carrier|air ticket\w*|flight ticket\w*|flights?|civil aviation|ticketing agent)\b/ },
   { license: 'IBSL Certificate', pattern: /\b(insurance|ibsl)\b/ },
   { license: 'Excise or Divisional Secretariat License', pattern: /\b(wine|liquor|bar|alcohol|excise)\b/ },
-  { license: 'Fuel Distribution Agreement', pattern: /\b(fuel station|fuel distribution|petroleum)\b/ },
+  { license: 'Fuel Distribution Agreement', pattern: /\b(fuel station|fuel distribution|filling station|gas station|petrol\w*|diesel|petroleum|lubricant\w*)\b/ },
   { license: 'SLMC Registration', pattern: /\b(doctor|dentist|dental|slmc)\b/ },
   { license: 'Veterinary Council Registration', pattern: /\b(veterinary|veterinarian|vet\b)\b/ },
   { license: 'Bar Association Registration', pattern: /\b(lawyer|legal service|attorney|bar association)\b/ },
+  {
+    license: 'Applicable Business License (Export of Goods)',
+    pattern: /\b(export\w*|import\s+export)\b/,
+    // Sri Lankan AoA objects clauses almost universally include boilerplate
+    // "import and export" wording that says nothing about the actual operating
+    // activity — the Laravel matrix's activity-text sources exclude AoA entirely.
+    // Only operational sources (BRC nature, Board Resolution, system record,
+    // website) may trigger this rule.
+    sourceExclude: /articles\s*of\s*association/i,
+    // Matrix rule: pure software / digital / IT / BPO / professional-services
+    // exporters are exempt unless physical-goods evidence is also present.
+    exception: (text) => (
+      /\b(software|digital|it services?|information technology|bpo|professional services?|saas|web|app development)\b/.test(text)
+      && !/\b(goods|products|merchandise|rubber|tea|spices|garments?|apparel|food|coconut|furniture|handicrafts?)\b/.test(text)
+    ),
+  },
 ];
 
 const inferRequiredLicenseDetailsFromChunks = (chunks = []) => {
@@ -1253,8 +1675,12 @@ const inferRequiredLicenseDetailsFromChunks = (chunks = []) => {
     const text = normalizeComparable(chunk.text || '');
     if (!text) return;
     LICENSE_RULES.forEach((rule) => {
-      const match = text.match(rule.pattern);
+      if (rule.sourceExclude && rule.sourceExclude.test(String(chunk.source || ''))) return;
+      // Strip excluded phrases first so e.g. "car clinic" cannot satisfy "clinic".
+      const scanText = rule.exclude ? text.replace(rule.exclude, ' ') : text;
+      const match = scanText.match(rule.pattern);
       if (!match) return;
+      if (typeof rule.exception === 'function' && rule.exception(scanText)) return;
       const existing = byLicense.get(rule.license);
       const trigger = match[0];
       const source = chunk.source || 'business activity information';
@@ -1302,6 +1728,14 @@ const hasRegulatedOperationalNature = (systemData = {}, documentData = {}) => {
 };
 
 const isRegulatoryLicenseRequirement = (documentName, reason = '') => {
+  // Identity documents mention "licence" (Driving Licence) and bank documents
+  // are never licenses — normalizeDocName maps NIC/passport/DL variants to
+  // "identity document", so both are excluded before the keyword test. Without
+  // this, an AI-required "Valid NIC, Passport, or Driving Licence" was treated
+  // as a regulatory-license requirement and falsely blocked onboarding.
+  const nameNorm = normalizeDocName(documentName || '');
+  if (nameNorm.includes('identity document') || nameNorm.includes('bank statement')) return false;
+
   const text = normalizeComparable(`${documentName || ''} ${reason || ''}`);
   return /\b(regulatory license|regulatory licence|license|licence|phsrc|nmra|ayurved\w*|homeopath\w*|medical|pharma\w*|cosmetic\w*|council)\b/.test(text)
     && /\b(license|licence|registration|approval|certificate)\b/.test(text);
@@ -1328,6 +1762,12 @@ const isDirectorIdentityForm20Reason = (reason = '') => {
 
 const shouldKeepAiRequiredDocument = ({ documentName, reason, requirements, systemData, documentData }) => {
   if (isAoAAttestationDateIssue({ document: documentName, field: documentName, reason })) return false;
+  if (isBankStatementRecencyIssue({ document: documentName, field: documentName, reason, rule: reason })) return false;
+  if (isBankCustomerAddressIssue({ document: documentName, field: documentName, reason, rule: reason })) return false;
+  // An identity document "mislabeled" as another identity type (passport in the
+  // ID-copy slot) is acceptable — never demand a re-upload for it.
+  if (isIdentityLabelContentSwap(reason)) return false;
+  if (isAcceptedBankDocumentLabelSwap(reason)) return false;
   const docNameNorm = normalizeKey(normalizeDocName(documentName));
   const reasonNorm = normalizeComparable(reason || '');
   if (
@@ -1449,11 +1889,19 @@ const isIdentityTypeOnlyMismatch = (row) => {
 
 const isAoAAttestationDateIssue = (row = {}) => {
   const docText = normalizeKey(normalizeDocName(`${row.document || ''} ${row.section || ''} ${row.field || ''}`));
-  if (!docText.includes('articlesofassociation')) return false;
+  // Attestation-recency rules apply to ID copies only. The AoA has no 3-month
+  // requirement here, and ROC forms (Form 01/20/40/13) are not time-limited
+  // (onboarding matrix §7) — recency complaints against them are noise.
+  const isExemptDocument = docText.includes('articlesofassociation')
+    || docText.includes('form1')
+    || docText.includes('form20')
+    || docText.includes('form40')
+    || docText.includes('form13');
+  if (!isExemptDocument) return false;
 
   const text = normalizeComparable(`${row.reason || ''} ${row.rule || ''} ${row.value || ''}`);
   return /\b(attestation|certified true copy|certification|true copy)\b/.test(text)
-    && /\b(date|dated|older|expired|stale|month|months|within)\b/.test(text);
+    && /\b(date|dated|older|expired|stale|month|months|within|recency)\b/.test(text);
 };
 
 const isSecretaryChangePromptMismatch = (row) => {
@@ -1470,6 +1918,10 @@ const shouldSuppressAiCrossDocumentMismatch = (row, systemData, documentData) =>
     || isAoAOperationalNatureMismatch(row, systemData, documentData)
     || isIdentityTypeOnlyMismatch(row)
     || isSecretaryChangePromptMismatch(row)
+    // The AI reports spacing/prefix-only differences as mismatches (e.g.
+    // "WU 10537" vs "WU10537", "8760" vs "PVS8760"). If the engine's own
+    // comparator says the two values are EQUAL, the AI's claim is noise.
+    || valuesEqual(row.documentValue, row.systemValue, row.field || '')
   )
 );
 
@@ -1483,7 +1935,7 @@ const shouldSuppressDocumentOnlyRow = (row) => {
     'registeredauthority', 'typeofcompany', 'legalstatus',
     'sharecapital', 'shareholderrights', 'registeredoffice',
     'listofdirectorssecretaries', 'signaturesfound',
-    'currency', 'statementdate', 'copyrightsensitiveproductsdetected',
+    'currency', 'statementdate', 'customeraddress', 'copyrightsensitiveproductsdetected',
     'termsandcondition', 'refundpolicyfound', 'changes',
   ].includes(fieldNorm)) return true;
 
@@ -1539,9 +1991,16 @@ const validateValue = ({ fieldName, fieldLabel, fieldType, value, source, docume
     const docNorm = normalizeDocName(document || '');
     const isIdentityDoc = docNorm.includes('identity') || docNorm.includes('passport') || docNorm.includes('driving');
     if (isIdentityDoc) {
+      // Foreign passports don't follow Sri Lankan formats (a UK passport is 9
+      // plain digits) — when the source document is a PASSPORT, accept any
+      // 6–10 character alphanumeric number instead of forcing NIC rules.
+      const isPassportDocument = String(document || '').toLowerCase().includes('passport');
+      const isPlausiblePassportNumber = (token) => /^[a-z0-9]{6,10}$/i.test(String(token).replace(/[^a-z0-9]/gi, ''));
+
       const tokens = extractIdentityTokens(text);
       const valuesToCheck = tokens.length ? tokens : [text];
-      const invalidTokens = valuesToCheck.filter((token) => !isValidIdentityToken(token));
+      const invalidTokens = valuesToCheck.filter((token) => !isValidIdentityToken(token)
+        && !(isPassportDocument && isPlausiblePassportNumber(token)));
       if (invalidTokens.length) {
         add('Sri Lankan NIC must be 9 digits plus V/X or 12 digits (or a valid passport number).');
       }
@@ -1607,10 +2066,39 @@ const isStakeholderCoverageItem = (item) => {
   );
 };
 
+const isBankCustomerAddressField = ({ section, field, documentName } = {}) => {
+  const sectionNorm = normalizeKey(section || '');
+  const fieldNorm = normalizeKey(field || '');
+  const docNorm = normalizeDocName(documentName || '');
+  const isCustomerAddress = fieldNorm === 'customeraddress'
+    || fieldNorm === 'bankcustomeraddress'
+    || (fieldNorm.includes('customer') && fieldNorm.includes('address'));
+  const isBankContext = sectionNorm === 'bankdetails'
+    || docNorm.includes('bank statement')
+    || docNorm.includes('bank confirmation');
+  return isCustomerAddress && isBankContext;
+};
+
+const isBankCustomerAddressRow = (row = {}) => isBankCustomerAddressField({
+  section: row.section,
+  field: row.field,
+  documentName: row.document || row.documentName,
+});
+
+const isBankCustomerAddressIssue = (row = {}) => {
+  if (isBankCustomerAddressRow(row)) return true;
+  const docNorm = normalizeDocName(`${row.document || row.documentName || ''} ${row.section || ''}`);
+  if (!docNorm.includes('bank statement') && !docNorm.includes('bank confirmation')) return false;
+  const text = normalizeComparable(`${row.field || ''} ${row.reason || ''} ${row.rule || ''}`);
+  return /\bcustomer\s+address\b/.test(text);
+};
+
 const shouldSkipPromptSystemComparison = ({ section, field, documentName }) => {
   const sectionNorm = normalizeKey(section || '');
   const fieldNorm = normalizeKey(field || '');
   const docNorm = normalizeDocName(documentName || '');
+
+  if (isBankCustomerAddressField({ section, field, documentName })) return true;
 
   if (
     ['ownerinformation', 'owners', 'stakeholders'].includes(sectionNorm)
@@ -1641,7 +2129,24 @@ const isNonBlockingPromptCoverageMissing = ({ section, field, documentName, reas
     return true;
   }
 
+  if (isBankCustomerAddressField({ section, field, documentName })) return true;
+
+  if (isBrcOwnerNicPromptGap({ section, field, documentName, reason })) return true;
+
   return false;
+};
+
+const isBrcOwnerNamePromptField = ({ section, field, documentName } = {}) => {
+  const sectionNorm = normalizeKey(section || '');
+  const fieldNorm = normalizeKey(field || '');
+  const docNorm = normalizeDocName(documentName || '');
+  const isOwnerNameField = fieldNorm === 'ownername'
+    || fieldNorm === 'proprietorname'
+    || (fieldNorm.includes('owner') && fieldNorm.includes('name'));
+  const isBrcContext = sectionNorm === 'businessregistration'
+    || docNorm.includes('business registration certificate')
+    || docNorm === 'brc';
+  return isOwnerNameField && isBrcContext;
 };
 
 const isCorporateSecretaryCoverageGroup = (item, stakeholderRouting) => {
@@ -1660,13 +2165,74 @@ const isCorporateSecretaryCoverageGroup = (item, stakeholderRouting) => {
     .test(text.replace(/[\/_-]+/g, ' '));
 };
 
-const findPreferredSystemRowForPromptField = ({ section, field }, systemFlatRows) => {
+const findStakeholderOwnerNameRow = (systemFlatRows, documentValue) => {
+  const groups = new Map();
+  systemFlatRows.forEach((row) => {
+    const parts = String(row.path || '').split('.');
+    if (parts.length < 2 || !['stakeholders', 'owners'].includes(parts[0])) return;
+    const prefix = parts.slice(0, 2).join('.');
+    if (!groups.has(prefix)) groups.set(prefix, []);
+    groups.get(prefix).push(row);
+  });
+
+  const pick = (rows, keys) => rows.find((row) => (
+    keys.includes(normalizeKey(row.field || row.canonical || '')) && !isBlank(row.value)
+  ));
+
+  const candidates = [...groups.entries()].map(([prefix, rows]) => {
+    const fullName = pick(rows, ['name', 'fullname']);
+    const registeredName = pick(rows, ['nameofregistereddirectorpartner', 'registeredname', 'directorpartnername']);
+    const firstName = pick(rows, ['firstname', 'first']);
+    const middleName = pick(rows, ['middlename', 'middle']);
+    const lastName = pick(rows, ['lastnameofrdp', 'lastname', 'last']);
+    const sourceRow = fullName || registeredName || firstName || lastName;
+    if (!sourceRow) return null;
+
+    const value = fullName?.value
+      || [registeredName?.value || firstName?.value, middleName?.value, lastName?.value]
+        .filter((part) => !isBlank(part))
+        .join(' ');
+    if (isBlank(value)) return null;
+
+    return {
+      field: 'stakeholder_owner_name',
+      label: 'Stakeholder Owner Name',
+      path: `${prefix}.__owner_name`,
+      canonical: 'stakeholderownername',
+      pathCanonical: normalizeKey(`${prefix}.__owner_name`),
+      value,
+    };
+  }).filter(Boolean);
+
+  if (!candidates.length) return null;
+  if (!isBlank(documentValue)) {
+    return candidates.find((row) => valuesEqual(documentValue, row.value, 'owner name'))
+      || candidates.find((row) => valuesNearMatch(documentValue, row.value))
+      || null;
+  }
+  return candidates[0];
+};
+
+const findPreferredSystemRowForPromptField = ({ section, field, documentName, documentValue }, systemFlatRows) => {
   const sectionNorm = normalizeKey(section || '');
   const fieldNorm = normalizeKey(field || '');
 
   if (sectionNorm === 'businessregistration' && fieldNorm === 'companyname') {
     return systemFlatRows.find((row) => row.path === 'business_information.registered_name_of_business')
       || systemFlatRows.find((row) => normalizeKey(row.path || '').endsWith('registerednameofbusiness'));
+  }
+
+  if (isBrcOwnerNamePromptField({ section, field, documentName })) {
+    return findStakeholderOwnerNameRow(systemFlatRows, documentValue);
+  }
+
+  // A document's Business Address corresponds to street_address_business, not
+  // street_address (the owner's legal/home address) — comparing against the
+  // latter produced false mismatches for merchants whose shop and home differ.
+  if (sectionNorm === 'businessregistration' && fieldNorm === 'businessaddress') {
+    const businessAddrRow = systemFlatRows.find((row) => row.path === 'business_information.street_address_business')
+      || systemFlatRows.find((row) => normalizeKey(row.path || '').endsWith('streetaddressbusiness'));
+    if (businessAddrRow && !isBlank(businessAddrRow.value)) return businessAddrRow;
   }
 
   return null;
@@ -1864,6 +2430,101 @@ const addAoABoardCrossChecks = (documentData, { addMismatch, addMatched }) => {
   });
 };
 
+const isStakeholderNameField = (fieldNorm) => (
+  fieldNorm === 'fullname'
+  || fieldNorm === 'name'
+  || fieldNorm === 'ownername'
+  || fieldNorm === 'stakeholdername'
+  || fieldNorm === 'directorname'
+  || fieldNorm === 'signatoryname'
+);
+
+const isStakeholderDobField = (fieldNorm) => (
+  fieldNorm === 'dateofbirth'
+  || fieldNorm === 'dob'
+  || fieldNorm === 'birthdate'
+  || fieldNorm === 'birthdatedate'
+);
+
+const normalizePersonName = (value = '') => normalizeComparable(value)
+  .replace(/\b(mr|mrs|ms|miss|dr)\b/g, ' ')
+  .replace(/\s+/g, ' ')
+  .trim();
+
+const nameTokens = (value = '') => normalizePersonName(value)
+  .split(/\s+/)
+  .filter((token) => token.length > 1);
+
+const fuzzyTokenMatch = (left, right) => (
+  left === right
+  || (
+    left.length >= 4
+    && right.length >= 4
+    && (
+      left.includes(right)
+      || right.includes(left)
+      || levenshteinDistance(left, right) <= 1
+    )
+  )
+);
+
+const namesStronglyMatch = (left, right) => {
+  const leftName = normalizePersonName(left);
+  const rightName = normalizePersonName(right);
+  if (!leftName || !rightName) return false;
+  if (leftName === rightName || valuesNearMatch(leftName, rightName)) return true;
+
+  const leftTokens = nameTokens(leftName);
+  const rightTokens = nameTokens(rightName);
+  if (leftTokens.length < 2 || rightTokens.length < 2) return false;
+
+  const matched = leftTokens.filter((leftToken) => (
+    rightTokens.some((rightToken) => fuzzyTokenMatch(leftToken, rightToken))
+  )).length;
+  return matched >= Math.min(2, leftTokens.length, rightTokens.length);
+};
+
+const normalizedDobValue = (value) => {
+  const parsed = parseDateValue(value);
+  if (parsed) return parsed.toISOString().slice(0, 10);
+  return normalizeComparable(value);
+};
+
+const groupsLikelySameStakeholder = (left, right) => {
+  const leftNames = [...(left.names || [])];
+  const rightNames = [...(right.names || [])];
+  const nameMatch = leftNames.some((leftName) => (
+    rightNames.some((rightName) => namesStronglyMatch(leftName, rightName))
+  ));
+  if (!nameMatch) return false;
+
+  const leftDobs = [...(left.dobValues || [])].filter(Boolean);
+  const rightDobs = [...(right.dobValues || [])].filter(Boolean);
+  if (leftDobs.length && rightDobs.length) {
+    return leftDobs.some((dob) => rightDobs.includes(dob));
+  }
+
+  const leftHasFullName = leftNames.some((name) => nameTokens(name).length >= 2);
+  const rightHasFullName = rightNames.some((name) => nameTokens(name).length >= 2);
+  return leftHasFullName && rightHasFullName;
+};
+
+const linkStakeholderGroupsByAcceptedIdentity = (groups) => {
+  const identityMatchedGroups = groups.filter((group) => (
+    group.systemPrefix && group.systemPrefixMatch === 'identity'
+  ));
+
+  groups.forEach((group) => {
+    if (group.systemPrefix) return;
+    const linkedGroup = identityMatchedGroups.find((candidate) => (
+      groupsLikelySameStakeholder(group, candidate)
+    ));
+    if (!linkedGroup) return;
+    group.systemPrefix = linkedGroup.systemPrefix;
+    group.systemPrefixMatch = 'linked_identity';
+  });
+};
+
 const buildStakeholderCoverageRouting = (coverage, systemFlatRows) => {
   const groupByItem = new Map();
   const groups = [];
@@ -1884,7 +2545,10 @@ const buildStakeholderCoverageRouting = (coverage, systemFlatRows) => {
         items: [],
         fieldNorms: new Set(),
         identityTokens: new Set(),
+        names: new Set(),
+        dobValues: new Set(),
         systemPrefix: null,
+        systemPrefixMatch: null,
       };
       groups.push(group);
       currentGroupByScope.set(scope, group);
@@ -1893,10 +2557,24 @@ const buildStakeholderCoverageRouting = (coverage, systemFlatRows) => {
     group.items.push(item);
     group.fieldNorms.add(fieldNorm);
     groupByItem.set(item, group);
-    extractIdentityTokens(aiExtractedValue(item)).forEach((token) => group.identityTokens.add(token));
+    const value = aiExtractedValue(item);
+    extractIdentityTokensForContext(
+      value,
+      aiField(item, ''),
+      aiSection(item) || '',
+      aiSource(item, ''),
+      aiDocument(item, '')
+    ).forEach((token) => group.identityTokens.add(token));
+    if (isStakeholderNameField(fieldNorm) && !isBlank(value)) {
+      group.names.add(displayValue(value));
+    }
+    if (isStakeholderDobField(fieldNorm) && !isBlank(value)) {
+      group.dobValues.add(normalizedDobValue(value));
+    }
   });
 
   const identityToStakeholderPrefix = new Map();
+  const identityTokenDisplay = new Map(); // canonical token → raw value as stored in the system
   systemFlatRows.forEach((row) => {
     const pathParts = String(row.path || '').split('.');
     if (pathParts.length < 2 || !['stakeholders', 'owners'].includes(pathParts[0])) return;
@@ -1910,9 +2588,10 @@ const buildStakeholderCoverageRouting = (coverage, systemFlatRows) => {
     if (!isIdentityRow) return;
 
     const prefix = pathParts.slice(0, 2).join('.');
-    extractIdentityTokens(row.value).forEach((token) => {
+    extractIdentityTokensForContext(row.value, row.field, row.label, row.path).forEach((token) => {
       if (!identityToStakeholderPrefix.has(token)) {
         identityToStakeholderPrefix.set(token, prefix);
+        identityTokenDisplay.set(token, displayValue(row.value));
       }
     });
   });
@@ -1922,12 +2601,65 @@ const buildStakeholderCoverageRouting = (coverage, systemFlatRows) => {
       const prefix = identityToStakeholderPrefix.get(token);
       if (prefix) {
         group.systemPrefix = prefix;
+        group.systemPrefixMatch = 'identity';
         break;
       }
     }
   });
 
-  return { groupByItem };
+  linkStakeholderGroupsByAcceptedIdentity(groups);
+
+  return {
+    groupByItem,
+    groups,
+    systemIdentityTokens: [...identityToStakeholderPrefix.keys()],
+    systemIdentityDisplay: identityTokenDisplay,
+  };
+};
+
+// Flags identity documents whose ID number matches NO stakeholder registered in
+// the system — a person on the documents who isn't on the system record. Only
+// same-type comparisons are made (NIC vs NIC, passport vs passport) so a
+// document NIC against a system passport never false-positives.
+const addUnmatchedStakeholderIdentityChecks = (stakeholderRouting, addMismatch) => {
+  const { groups = [], systemIdentityTokens = [], systemIdentityDisplay = new Map() } = stakeholderRouting;
+  const seenTokenSets = new Set();
+  const showToken = (token) => systemIdentityDisplay.get(token) || token;
+
+  groups.forEach((group) => {
+    if (group.systemPrefix || !group.identityTokens.size) return;
+    // Corporate company secretaries are entities, not people — their SEC/FRM
+    // registration numbers must not be treated as unmatched personal IDs.
+    if (group.items.some((item) => isCorporateSecretaryCoverageGroup(item, stakeholderRouting))) return;
+
+    const docTokens = [...group.identityTokens];
+    const tokenSetKey = docTokens.slice().sort().join('|');
+    if (seenTokenSets.has(tokenSetKey)) return;
+
+    const docTypes = new Set(docTokens.map(identityTokenType).filter(Boolean));
+    if (!docTypes.size) return;
+    const sameTypeSystemIds = systemIdentityTokens
+      .filter((token) => docTypes.has(identityTokenType(token)));
+    if (!sameTypeSystemIds.length) return; // only cross-type IDs on record — not comparable
+
+    seenTokenSets.add(tokenSetKey);
+
+    const idItem = group.items.find((item) => extractIdentityTokens(aiExtractedValue(item)).length);
+    const nameItem = group.items.find((item) => ['fullname', 'name'].includes(normalizeKey(aiField(item, ''))));
+    const personName = nameItem ? displayValue(aiExtractedValue(nameItem)) : '';
+    const docIdDisplay = displayValue(idItem ? aiExtractedValue(idItem) : docTokens.join(', '));
+    const systemIdList = sameTypeSystemIds.slice(0, 5).map(showToken).join(', ')
+      + (sameTypeSystemIds.length > 5 ? ', …' : '');
+
+    addMismatch({
+      field: idItem ? aiField(idItem, 'NIC/Passport/DL Number') : 'NIC/Passport/DL Number',
+      document: idItem ? aiDocument(idItem, 'Identity document') : 'Identity document',
+      documentValue: docIdDisplay,
+      systemValue: systemIdList,
+      reason: `Identity document${personName && personName !== '-' ? ` for "${personName}"` : ''} carries ID ${docIdDisplay}, which does not match any stakeholder registered in the system (registered stakeholder ID(s): ${systemIdList}). The person on the submitted ID is not on the system record, or the recorded ID is wrong.`,
+      category: 'identity_cross_check',
+    });
+  });
 };
 
 const addPromptCoverageComparisons = (documentData, systemFlatRows, {
@@ -1939,6 +2671,8 @@ const addPromptCoverageComparisons = (documentData, systemFlatRows, {
 }) => {
   const coverage = promptCoverageItems(documentData);
   const stakeholderRouting = buildStakeholderCoverageRouting(coverage, systemFlatRows);
+
+  addUnmatchedStakeholderIdentityChecks(stakeholderRouting, addMismatch);
 
   // Build document → NIC map so we can route each owner document to its matching stakeholder.
   // New-format NICs sometimes get a trailing V/X appended by OCR — normalise it away.
@@ -1961,13 +2695,19 @@ const addPromptCoverageComparisons = (documentData, systemFlatRows, {
     let systemRow;
     if (!skipSystemComparison && stakeholderGroup?.systemPrefix) {
       const stakeholderRows = systemFlatRows.filter((r) => String(r.path || '').startsWith(`${stakeholderGroup.systemPrefix}.`));
-      systemRow = findFlatValue(stakeholderRows, comparisonAliasesFor(field, section, documentName, apiSource));
+      systemRow = findFlatValue(stakeholderRows, promptComparisonAliases({ field, section, documentName, apiSource }));
     }
     if (!skipSystemComparison && !systemRow) {
-      systemRow = findPreferredSystemRowForPromptField({ section, field }, systemFlatRows);
+      systemRow = findPreferredSystemRowForPromptField({
+        section,
+        field,
+        documentName,
+        documentValue: docValue,
+      }, systemFlatRows);
     }
-    if (!skipSystemComparison && !systemRow && !stakeholderGroup) {
-      systemRow = findFlatValue(systemFlatRows, comparisonAliasesFor(field, section, documentName, apiSource));
+    if (!skipSystemComparison && !systemRow && !stakeholderGroup
+      && !isBrcOwnerNamePromptField({ section, field, documentName })) {
+      systemRow = findFlatValue(systemFlatRows, promptComparisonAliases({ field, section, documentName, apiSource }));
     }
 
     const systemValue = systemRow?.value;
@@ -2071,6 +2811,29 @@ const addPromptCoverageComparisons = (documentData, systemFlatRows, {
         documentValue: displayValue(docValue),
         systemValue: displayValue(systemValue),
         nearMatch: true,
+      });
+      return;
+    }
+
+    // A passport number vs an NIC are different identifier TYPES — both can be
+    // valid for the same person (prompt rule: never a mismatch by themselves).
+    if (isIdentityComparisonContext(normalizeKey(field)) && hasCrossTypeIdentityPair(docValue, systemValue)) {
+      if (stakeholderGroup?.systemPrefix && ['identity', 'linked_identity'].includes(stakeholderGroup.systemPrefixMatch)) {
+        addMatched({
+          field,
+          document: documentName,
+          documentValue: displayValue(docValue),
+          systemValue: displayValue(systemValue),
+          nearMatch: true,
+          matchReason: 'Valid: this stakeholder is already matched by another accepted identity document (NIC, passport, or driving licence), so the alternate ID is accepted.',
+        });
+        return;
+      }
+      addDocumentOnly({
+        field,
+        document: documentName,
+        value: displayValue(docValue),
+        reason: 'Different identifier types (NIC vs passport/DL) - both may be valid for the same person; not treated as a mismatch.',
       });
       return;
     }
@@ -2290,9 +3053,19 @@ const buildVerificationReport = ({
     addUnique(matchedData, row, [row.field, row.document, row.documentValue, row.systemValue]);
   };
 
+  // Licenses are uploaded under the generic "license_if_required" slot(s), so a
+  // name match can never connect that label to a specific requirement such as
+  // "Applicable Business License (Export of Goods)". Any uploaded license-slot
+  // file counts as PRESENT for license-type requirements; whether its CONTENT
+  // is the right license is still judged by the AI's FaultyDocument findings.
+  const LICENSE_SLOT_RE = /\blicen[cs]e\b/;
+  const hasUploadedLicenseSlot = [...apiDocLabels, ...uploadedDocNames]
+    .some((label) => LICENSE_SLOT_RE.test(normalizeDocName(stripAiDocumentLabel(String(label || '')))));
+
   effectiveRequirements.forEach((requirement) => {
     const matchedDocument = findMatchingDocument(requirement, documents, uploadedDocNames);
     const isMandatory = Boolean(requirement.is_mandatory);
+    if (hasUploadedLicenseSlot && isRegulatoryLicenseRequirement(requirement.required_docs, requirement.description || '')) return;
 
     if (isMandatory && !matchedDocument) {
       addMissing({
@@ -2402,6 +3175,11 @@ const buildVerificationReport = ({
     documentData.FaultyDocument.forEach((fault) => {
       const documentName = fault['Document Name'] || fault.document_name || fault.name || 'Faulty document';
       const reason = fault.Reason || fault.reason || fault.issue || 'Document failed Google AI validation.';
+      // Skip "NIC mismatch" faults that are only an old (9-digit + V/X) vs new
+      // (12-digit) Sri Lankan NIC format difference — the same person, not a fault.
+      if (/\bnic\b/i.test(reason) && isPureIdentityFormatMismatch(reason)) return;
+      if (isBankCustomerAddressIssue({ document: documentName, field: documentName, reason, rule: reason })) return;
+      if (isAcceptedBankDocumentLabelSwap(reason)) return;
       addInvalid({
         field: documentName,
         source: SOURCE_DOCUMENTS,
@@ -2468,6 +3246,7 @@ const buildVerificationReport = ({
 
   const policyFilteredMismatches = mismatches.filter(
     (row) => !shouldSuppressAiCrossDocumentMismatch(row, systemData, documentData)
+      && !isBankCustomerAddressIssue(row)
   );
 
   // Fields already seen in matched/mismatch/invalid rows don't need a separate Missing entry.
@@ -2483,6 +3262,8 @@ const buildVerificationReport = ({
 
   const cleanMissing = stripKeys(missingData).filter((row) => {
     if (isNonMandatoryAiDoc(row)) return false;
+    if (isBankCustomerAddressIssue(row)) return false;
+    if (isBrcOwnerNicMissingIssue(row)) return false;
     if (
       row.category === 'prompt_field_comparison'
       && String(row.documentValue || '').toLowerCase() === '(not found)'
@@ -2502,7 +3283,9 @@ const buildVerificationReport = ({
 
   const cleanInvalid = stripKeys(invalidData).filter((row) => {
     if (isNonMandatoryAiDoc(row)) return false;
+    if (isBankCustomerAddressIssue(row)) return false;
     if (isAoAAttestationDateIssue(row)) return false;
+    if (isBankStatementRecencyIssue(row)) return false;
     if (isIdentityTypeOnlyMismatch(row)) return false;
     if (isFalseFutureDateIssue(row)) return false;
     // Document-level AI findings (whole-document flags: label mismatches, duplicates,
@@ -2534,6 +3317,7 @@ const buildVerificationReport = ({
   const unifiedRows = [];
 
   const matchedComment = (row) => {
+    if (row.matchReason) return row.matchReason;
     if (row.nearMatch) {
       return 'Needs review: values are similar but not identical. Confirm the value is valid before approval.';
     }
@@ -2676,10 +3460,16 @@ const buildVerificationReport = ({
       const documentName = stripDocLabel(fault['Document Name'] || fault.document_name || fault.name || '');
       const reason = fault.Reason || fault.reason || fault.issue || '';
       if (isAoAAttestationDateIssue({ document: documentName, field: documentName, reason })) return;
+      if (isBankStatementRecencyIssue({ document: documentName, field: documentName, reason, rule: reason })) return;
       if (isFalseFutureDateIssue({ document: documentName, field: documentName, reason })) return;
       // Duplicate / out-of-scope uploads are not validity failures — a valid copy
       // already satisfies the requirement, so they must not invalidate or block it.
       if (isNonBlockingDocumentFault(reason)) return;
+      // "Expected ID Copy, found Passport" — any identity document satisfies the
+      // ID slot; an identity-to-identity label difference is not a fault.
+      if (isIdentityLabelContentSwap(reason)) return;
+      if (isBankCustomerAddressIssue({ document: documentName, field: documentName, reason, rule: reason })) return;
+      if (isAcceptedBankDocumentLabelSwap(reason)) return;
 
       const key = normalizeDocName(documentName);
       if (!key) return;
@@ -2701,6 +3491,18 @@ const buildVerificationReport = ({
       value: aiExtractedValue(item),
     };
     if (isAoAAttestationDateIssue({ document: key, ...invalidField })) return;
+    if (isBankCustomerAddressIssue({
+      document: aiDocument(item, key),
+      section: aiSection(item),
+      ...invalidField,
+      rule: invalidField.reason,
+    })) return;
+    if (isBankStatementRecencyIssue({
+      document: aiDocument(item, key),
+      section: aiSection(item),
+      ...invalidField,
+      rule: invalidField.reason,
+    })) return;
     if (isFalseFutureDateIssue({ document: key, ...invalidField })) return;
     if (!invalidFieldsByDoc.has(key)) invalidFieldsByDoc.set(key, []);
     invalidFieldsByDoc.get(key).push(invalidField);
@@ -2715,14 +3517,60 @@ const buildVerificationReport = ({
     return { faults, invalidFields };
   };
 
+  // Documents the AI itself confirmed present or extracted fields from. Their
+  // "source" names (e.g. "Nature of Business Letter") often match a requirement
+  // better than the raw upload label (e.g. "upload_nat_business_doc"), so a
+  // present document is never falsely reported missing over a label mismatch.
+  const aiPresentDocNames = [
+    ...aiArraysFor(documentData, AI_DOCUMENT_PRESENCE_KEYS)
+      .filter((dp) => isPlainObject(dp)
+        && !isIgnoredItemSource(dp)
+        && (aiBool(firstValueByKeys(dp, ['present', 'isPresent', 'is_present', 'found', 'exists'])) === true
+          || aiStatus(dp) === 'present'))
+      .map((dp) => stripDocLabel(aiDocument(dp, ''))),
+    ...promptCoverageItems(documentData).flatMap((item) => [
+      stripDocLabel(aiSource(item, '')),
+      stripDocLabel(aiDocument(item, '')),
+    ]),
+  ].filter((label) => label && !isIgnoredSource(label));
+
+  // Sole-proprietor rule (onboarding matrix §4.3): a proprietor may operate
+  // without a BRC — the owner's NIC then serves as the business registration
+  // number. When the system record confirms this (registration number equals a
+  // stakeholder NIC), a missing BRC is waived instead of blocking onboarding.
+  const isProprietorType = /proprietor/i.test(merchantType?.name || '');
+  const systemRegTokens = extractIdentityTokens(systemData?.business_information?.business_registration_number || '');
+  const stakeholderIdTokens = (systemData?.stakeholders || []).flatMap((s) => extractIdentityTokens(s?.id));
+  const brcWaivedByNicRegistration = isProprietorType
+    && systemRegTokens.length > 0
+    && systemRegTokens.some((token) => stakeholderIdTokens.includes(token));
+
   const documentChecks = effectiveRequirements.map((req) => {
     const name = req.required_docs;
     const reqKey = normalizeDocName(stripDocLabel(name));
 
+    const isLicenseRequirement = isRegulatoryLicenseRequirement(name, req.description || '');
+
     const present = apiDocLabels.some((label) => namesMatch(normalizeDocName(stripDocLabel(label)), reqKey))
-      || uploadedDocNames.some((label) => namesMatch(normalizeDocName(label), reqKey));
+      || uploadedDocNames.some((label) => namesMatch(normalizeDocName(label), reqKey))
+      || aiPresentDocNames.some((label) => namesMatch(normalizeDocName(label), reqKey))
+      // Licenses live in the generic "license_if_required" slot — its label can
+      // never name-match a specific license requirement.
+      || (isLicenseRequirement && hasUploadedLicenseSlot);
+
+    const waived = !present
+      && brcWaivedByNicRegistration
+      && reqKey.includes('business registration certificate');
 
     const { faults, invalidFields } = docIssues(name);
+    // A license requirement satisfied via the generic slot inherits any AI
+    // faults raised against that slot (e.g. "content does not match label"),
+    // so a mislabeled upload shows as uploaded-but-invalid, not missing.
+    if (isLicenseRequirement && hasUploadedLicenseSlot) {
+      faultsByDoc.forEach((reasons, key) => {
+        if (LICENSE_SLOT_RE.test(key)) faults.push(...reasons);
+      });
+    }
 
     const linkedInvalids = cleanInvalid
       .filter((r) => r.category === 'ai_prompt_field'
@@ -2739,6 +3587,20 @@ const buildVerificationReport = ({
       const k = `${issue.type}|${issue.field || ''}|${issue.reason}`;
       if (seenIssues.has(k)) return false;
       seenIssues.add(k);
+      if (isBankStatementRecencyIssue({
+        document: name,
+        section: req.description || '',
+        field: issue.field || name,
+        reason: issue.reason || '',
+        rule: issue.reason || '',
+      })) return false;
+      if (isBankCustomerAddressIssue({
+        document: name,
+        section: req.description || '',
+        field: issue.field || name,
+        reason: issue.reason || '',
+        rule: issue.reason || '',
+      })) return false;
       // Suppress false future-date flags: if the issue says "future" but the date
       // is actually in the past under any reasonable format interpretation, drop it.
       if (/\bfuture\b/i.test(issue.reason)) {
@@ -2753,8 +3615,11 @@ const buildVerificationReport = ({
       description: req.description || null,
       isMandatory: Boolean(req.is_mandatory),
       present,
+      waived,
       valid: !present ? false : uniqueIssues.length === 0,
-      issues: uniqueIssues,
+      issues: waived
+        ? [{ type: 'document', field: null, reason: "Waived: no BRC on file — the owner's NIC serves as the business registration number (sole-proprietor rule)." }, ...uniqueIssues]
+        : uniqueIssues,
       licenseSourceDocs: req.licenseSourceDocs || null,
     };
   });
@@ -2762,7 +3627,9 @@ const buildVerificationReport = ({
   // ── Verdict ────────────────────────────────────────────────────────────────
   // Severity policy (see classifyOnboardingSeverity): only mandatory-document
   // gaps and bank/identity issues block; everything else is a minor "caution".
-  const { status, blockingCount, blockingReasons } = classifyOnboardingSeverity({
+  const {
+    status, blockingCount, blockingReasons, decision: onboardingDecision,
+  } = buildOnboardingDecision({
     missingData: cleanMissing,
     invalidData: cleanInvalid,
     mismatches: cleanMismatches,
@@ -2829,6 +3696,7 @@ const buildVerificationReport = ({
     statusLabel: statusLabelFor(status),
     blockingCount,
     minorIssueCount,
+    onboardingDecision,
     summary: {
       receivedDocuments: apiDocLabels.length || documents.length,
       configuredRequirements: effectiveRequirements.length,
@@ -2905,7 +3773,9 @@ const patchReportCompatibleMismatches = (report, compatibleFields) => {
   // Re-run the severity policy on the patched arrays so the verdict stays
   // consistent with buildVerificationReport (mandatory docs + bank/identity block;
   // everything else is a minor "caution").
-  const { status: newStatus, blockingCount, blockingReasons } = classifyOnboardingSeverity({
+  const {
+    status: newStatus, blockingCount, blockingReasons, decision: newOnboardingDecision,
+  } = buildOnboardingDecision({
     missingData: report.missingData || [],
     invalidData: report.invalidData || [],
     mismatches: keptMismatches,
@@ -2956,6 +3826,7 @@ const patchReportCompatibleMismatches = (report, compatibleFields) => {
     status: newStatus,
     statusLabel: statusLabelFor(newStatus),
     blockingCount,
+    onboardingDecision: newOnboardingDecision,
     summary: {
       ...(report.summary || {}),
       matchedFields: newMatchedData.length,
@@ -2971,4 +3842,6 @@ const patchReportCompatibleMismatches = (report, compatibleFields) => {
 module.exports = {
   buildVerificationReport,
   patchReportCompatibleMismatches,
+  // exported for license-rule regression testing
+  requiredOperationalLicenseDetails,
 };

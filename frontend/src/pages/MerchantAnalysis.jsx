@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useLocation } from 'react-router-dom';
+import { useLocation, useSearchParams } from 'react-router-dom';
 import PageLayout from '../components/PageLayout';
 import api from '../services/api';
 
@@ -80,6 +80,97 @@ const fmtDate = (value) => value
   })
   : '-';
 
+const normalizeDecisionKey = (value) => String(value ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
+const sameDecisionTarget = (leftField, leftDocument, rightField, rightDocument) => {
+  const lf = normalizeDecisionKey(leftField);
+  const rf = normalizeDecisionKey(rightField);
+  const ld = normalizeDecisionKey(leftDocument);
+  const rd = normalizeDecisionKey(rightDocument);
+  if (!lf || !rf || lf !== rf) return false;
+  if (!ld || !rd) return true;
+  return ld === rd || ld.includes(rd) || rd.includes(ld);
+};
+
+const issueHasManualResolution = (issue, overrides = [], corrections = []) => {
+  const field = issue.field || issue.title || '';
+  const document = issue.document || '';
+  return overrides.some((ov) => sameDecisionTarget(field, document, ov.field_name, ov.document_source))
+    || corrections.some((corr) => sameDecisionTarget(field, document, corr.field_name, corr.document_source));
+};
+
+const buildEffectiveDecision = (report, overrides = [], corrections = []) => {
+  const decision = report?.onboardingDecision;
+  if (!decision) return null;
+  const originalBlocking = decision.blockingIssues || [];
+  if (originalBlocking.length === 0) return decision;
+
+  const remainingBlocking = originalBlocking.filter(
+    (issue) => !issueHasManualResolution(issue, overrides, corrections)
+  );
+  const resolvedCount = originalBlocking.length - remainingBlocking.length;
+  if (resolvedCount === 0) return decision;
+
+  if (remainingBlocking.length === 0) {
+    return {
+      ...decision,
+      canOnboard: true,
+      outcome: 'eligible',
+      headline: 'Eligible for onboarding',
+      summary: `${resolvedCount} blocking issue(s) were resolved or ignored with reviewer action. This merchant is now eligible for onboarding based on the effective review state.`,
+      blockingIssues: [],
+      nextSteps: [],
+      resolvedCount,
+      effectiveReviewApplied: true,
+    };
+  }
+
+  return {
+    ...decision,
+    canOnboard: false,
+    outcome: 'blocked',
+    headline: 'Onboarding blocked',
+    summary: `Onboarding is still blocked by ${remainingBlocking.length} issue(s). ${resolvedCount} issue(s) were resolved or ignored with reviewer action.`,
+    blockingIssues: remainingBlocking,
+    nextSteps: [...new Set(remainingBlocking.map((issue) => issue.requiredAction).filter(Boolean))],
+    resolvedCount,
+    effectiveReviewApplied: true,
+  };
+};
+
+const labelForEffectiveStatus = (status) => (
+  status === 'verified' ? 'Verified'
+    : status === 'caution' ? 'Caution'
+      : status === 'review_required' ? 'Review required'
+        : status
+);
+
+const applyEffectiveDecisionToReport = (report, overrides = [], corrections = []) => {
+  if (!report) return report;
+  const decision = buildEffectiveDecision(report, overrides, corrections);
+  if (!decision) return report;
+  const status = decision.canOnboard ? 'verified' : (report.status || 'review_required');
+  const blockingCount = decision.blockingIssues?.length || 0;
+  return {
+    ...report,
+    status,
+    statusLabel: labelForEffectiveStatus(status),
+    blockingCount,
+    onboardingDecision: decision,
+    ruleChecks: (report.ruleChecks || []).map((check) => (
+      check.isVerdict
+        ? {
+          ...check,
+          status: decision.canOnboard ? 'pass' : 'fail',
+          detail: decision.canOnboard
+            ? 'Eligible for onboarding after reviewer fixes/ignores.'
+            : decision.summary,
+        }
+        : check
+    )),
+  };
+};
+
 
 function StatusPill({ status, label }) {
   return (
@@ -157,9 +248,81 @@ function ExpandableComment({ text }) {
   );
 }
 
-function UnifiedTable({ rows = [], allDocuments = [] }) {
+// Inline editor for the AI value of one row — used when the AI misread a value
+// and the reviewer corrects it manually.
+function AiValueCell({ row, correction, onSave, onUndo }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const startEdit = () => {
+    setDraft(row.aiValue && row.aiValue !== '—' && row.aiValue !== '(not found)' ? String(row.aiValue) : '');
+    setEditing(true);
+  };
+
+  const save = async () => {
+    if (!draft.trim() || busy) return;
+    setBusy(true);
+    await onSave(row, draft.trim());
+    setBusy(false);
+    setEditing(false);
+  };
+  const displayValue = correction ? correction.new_value : row.aiValue;
+
+  if (editing) {
+    return (
+      <td className="td-value">
+        <div className="ai-value-edit-wrap">
+          <input
+            className="rule-override-comment-input"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') { e.preventDefault(); save(); }
+              if (e.key === 'Escape') setEditing(false);
+            }}
+            placeholder="Correct value…"
+            autoFocus
+          />
+          <div className="rule-override-input-actions">
+            <button type="button" className="rule-override-confirm-btn" onClick={save} disabled={!draft.trim() || busy}>
+              {busy ? '…' : 'Save'}
+            </button>
+            <button type="button" className="rule-override-cancel-btn" onClick={() => setEditing(false)}>Cancel</button>
+          </div>
+        </div>
+      </td>
+    );
+  }
+
+  return (
+    <td className="td-value">
+      <div className="ai-value-cell">
+        <span>{formatCell(displayValue)}</span>
+        {correction ? (
+          <span className="ai-value-corrected" title={`Manually corrected${correction.corrected_by ? ` by ${correction.corrected_by}` : ''}${correction.old_value ? ` (AI read: ${correction.old_value})` : ''}`}>
+            ✎ corrected
+            <button type="button" className="ai-value-undo" onClick={() => onUndo(correction)} title="Remove this correction and restore the AI value">
+              Undo
+            </button>
+          </span>
+        ) : (
+          <button type="button" className="ai-value-edit-btn" onClick={startEdit} title="Correct this AI-extracted value manually">
+            ✎
+          </button>
+        )}
+      </div>
+    </td>
+  );
+}
+
+function UnifiedTable({ rows = [], allDocuments = [], corrections = [], onSaveCorrection, onDeleteCorrection }) {
   const [filter, setFilter] = useState('all');
   const [viewerDoc, setViewerDoc] = useState(null);
+
+  const correctionFor = (row) => corrections.find(
+    (c) => c.field_name === (row.field || '') && (c.document_source || '') === (row.document || '')
+  ) || null;
   const filtered = filter === 'all' ? rows : rows.filter((row) => row.status === filter);
   const counts = FILTER_OPTIONS.reduce((acc, opt) => {
     acc[opt.key] = opt.key === 'all' ? rows.length : rows.filter((row) => row.status === opt.key).length;
@@ -237,7 +400,9 @@ function UnifiedTable({ rows = [], allDocuments = [] }) {
                       )}
                     </div>
                   </td>
-                  <td className="td-value">{formatCell(row.aiValue)}</td>
+                  {onSaveCorrection
+                    ? <AiValueCell row={row} correction={correctionFor(row)} onSave={onSaveCorrection} onUndo={onDeleteCorrection} />
+                    : <td className="td-value">{formatCell(row.aiValue)}</td>}
                   <td className="td-value">{formatCell(row.apiValue)}</td>
                   <td>
                     <span className={`unified-status-badge unified-status-badge--${cfg.tone}`}>
@@ -317,6 +482,16 @@ function DocViewerModal({ doc, onClose }) {
 }
 
 const getSolution = (item, ruleKey) => {
+  // Rows that carry their own remediation action (e.g. verdict blocking issues)
+  // display it directly instead of a heuristic suggestion.
+  if (item.solution) return item.solution;
+
+  // "Failed to load" = the document download timed out during the AI run — the
+  // file is uploaded and fine; re-uploading is the wrong advice.
+  if (/failed to load|load failure|timed? ?out/i.test(String(item.comment || ''))) {
+    return 'Re-run the analysis ("Re-extract Docs") — the document is already uploaded; the previous run hit a temporary download failure.';
+  }
+
   const field   = item.field    || 'this field';
   const doc     = (item.document && item.document !== '—') ? item.document : null;
   const comment = String(item.comment || '').toLowerCase();
@@ -375,6 +550,20 @@ const getSolution = (item, ruleKey) => {
 
 const getRuleItems = (check, report) => {
   if (!report) return [];
+
+  // The verdict row expands into the justified blocking issues: what blocked,
+  // the evidence values, the policy rule violated, and the required action.
+  if (check.isVerdict) {
+    return (report.onboardingDecision?.blockingIssues || []).map((issue) => ({
+      field:    issue.field,
+      document: issue.document || '—',
+      aiValue:  issue.documentValue || '—',
+      apiValue: issue.systemValue || '—',
+      comment:  `${issue.reason}${issue.policy ? ` ${issue.policy}` : ''}`,
+      solution: issue.requiredAction,
+    }));
+  }
+
   const rows = report.unifiedRows || [];
   const key = RULE_STATUS_MAP[check.name];
 
@@ -497,6 +686,9 @@ function RuleCheckItem({ check, report, allDocuments = [], mid, overrides = [], 
   const items = getRuleItems(check, report);
   const hasItems = items.length > 0;
   const ruleKey = RULE_STATUS_MAP[check.name];
+  // Verdict blocking issues mirror rows from the other rule checks — override
+  // them there; the verdict table itself is read-only justification.
+  const rowMid = check.isVerdict ? null : mid;
 
   const findOverride = (item) => overrides.find((ov) =>
     ov.rule_check_name === check.name &&
@@ -540,7 +732,7 @@ function RuleCheckItem({ check, report, allDocuments = [], mid, overrides = [], 
                   <th>System Value</th>
                   <th>Detail / Reason</th>
                   <th className="rule-solution-col">Solution</th>
-                  {mid && <th className="rule-action-col">Action</th>}
+                  {rowMid && <th className="rule-action-col">Action</th>}
                 </tr>
               </thead>
               <tbody>
@@ -551,7 +743,7 @@ function RuleCheckItem({ check, report, allDocuments = [], mid, overrides = [], 
                     checkName={check.name}
                     ruleKey={ruleKey}
                     override={findOverride(row)}
-                    mid={mid}
+                    mid={rowMid}
                     allDocuments={allDocuments}
                     onViewDoc={(doc) => setViewerDoc(doc)}
                     onSave={onSaveOverride}
@@ -717,6 +909,51 @@ function DocumentChecksTable({ checks = [], overrides = [], allDocuments = [] })
   );
 }
 
+// Narrative justification for the onboarding verdict: why the merchant was or
+// wasn't onboarded, plus the concrete actions needed to unblock a rejection.
+function OnboardingDecisionCard({ decision }) {
+  if (!decision) return null;
+  const blocked = !decision.canOnboard;
+
+  return (
+    <div className="card">
+      <div className="card-header">
+        <span className="card-title">
+          <span className="card-title-accent" />
+          Onboarding Decision
+        </span>
+        <span
+          className={`unified-status-badge unified-status-badge--${blocked ? 'invalid' : 'success'}`}
+          style={{ fontSize: 12 }}
+        >
+          {blocked ? '✕' : '✓'} {decision.headline}
+        </span>
+      </div>
+      <div className="card-body">
+        <p style={{ margin: '4px 0 10px', lineHeight: 1.55 }}>{decision.summary}</p>
+        {decision.effectiveReviewApplied && (
+          <p style={{ margin: '0 0 10px', fontSize: 12, color: 'var(--ash-2)' }}>
+            Reviewer fixes/ignores are included in this effective decision.
+          </p>
+        )}
+        {blocked && decision.nextSteps?.length > 0 && (
+          <>
+            <div className="form-label" style={{ marginBottom: 6 }}>Required actions to unblock onboarding</div>
+            <ol style={{ margin: 0, paddingLeft: 20, lineHeight: 1.6 }}>
+              {decision.nextSteps.map((step, i) => (
+                <li key={i}>{step}</li>
+              ))}
+            </ol>
+          </>
+        )}
+        {decision.policyNote && (
+          <p style={{ marginTop: 10, fontSize: 12, color: 'var(--ash)' }}>{decision.policyNote}</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function RuleChecks({ checks = [], report, allDocuments = [], mid, overrides = [], onSaveOverride, onDeleteOverride }) {
   if (!checks.length) return null;
 
@@ -805,6 +1042,215 @@ function VerificationSummary({ report, overrides = [] }) {
         <SummaryMetric label="Mismatches" value={mismatches} tone="danger" />
         <SummaryMetric label="AI-Onboarding-V2" value={summary.documentOnlyData || 0} tone="warning" />
         <SummaryMetric label="System Data" value={summary.systemOnlyData || 0} tone="warning" />
+      </div>
+    </div>
+  );
+}
+
+const MATCH_TYPE_LABEL = {
+  nic:      { label: 'NIC',            tone: 'danger' },
+  passport: { label: 'Passport',      tone: 'danger' },
+  name_dob: { label: 'Name + DOB',    tone: 'warn'   },
+};
+
+// Flags stakeholders (director/owner/partner) on this merchant who are ALSO
+// registered under other businesses. Strong matches = NIC/passport; weak = name+DOB.
+function StakeholderCrossCheckCard({ data, loading }) {
+  if (loading) {
+    return (
+      <div className="card">
+        <div className="card-header">
+          <span className="card-title">
+            <span className="card-title-accent" />
+            Stakeholder Cross-Check
+          </span>
+        </div>
+        <div className="empty-state"><div className="empty-state-text">Checking other businesses…</div></div>
+      </div>
+    );
+  }
+
+  if (!data) return null;
+  const matches = data.matches || [];
+
+  return (
+    <div className="card">
+      <div className="card-header">
+        <span className="card-title">
+          <span className="card-title-accent" />
+          Stakeholder Cross-Check
+        </span>
+        <span className={`unified-status-badge unified-status-badge--${matches.length ? 'danger' : 'success'}`} style={{ fontSize: 12 }}>
+          {matches.length
+            ? `⚠ ${matches.length} also in other businesses`
+            : '✓ No overlap found'}
+        </span>
+      </div>
+
+      {matches.length === 0 ? (
+        <div className="empty-state">
+          <div className="empty-state-text">
+            None of this merchant's stakeholders are registered under another business.
+          </div>
+        </div>
+      ) : (
+        <div className="table-wrapper">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>Stakeholder</th>
+                <th style={{ width: 130 }}>Matched On</th>
+                <th>Also Registered In</th>
+              </tr>
+            </thead>
+            <tbody>
+              {matches.map((m, i) => {
+                const cfg = MATCH_TYPE_LABEL[m.match_type] || { label: m.match_type, tone: 'sys' };
+                return (
+                  <tr key={`${m.identifier}-${i}`} className="unified-row unified-row--danger">
+                    <td className="td-name">
+                      {m.person?.name || '(unknown)'}
+                      {m.person?.role && (
+                        <div className="td-meta" style={{ fontSize: 11 }}>{m.person.role}</div>
+                      )}
+                      <div className="td-meta" style={{ fontSize: 11, color: 'var(--ash)' }}>{m.identifier}</div>
+                    </td>
+                    <td>
+                      <span className={`unified-status-badge unified-status-badge--${cfg.tone}`} style={{ fontSize: 11 }}>
+                        {cfg.label}
+                      </span>
+                    </td>
+                    <td className="td-value">
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                        {m.also_registered_in.map((b, j) => (
+                          <span key={j}>
+                            <strong>{b.business}</strong>
+                            <span style={{ color: 'var(--ash)' }}> · MID {b.mid}{b.role ? ` · ${b.role}` : ''}{b.source ? ` (${b.source})` : ''}</span>
+                          </span>
+                        ))}
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Live progress indicator while an analysis runs. The backend is a single HTTP
+// call (no streaming), so stages advance on realistic time heuristics with an
+// honest elapsed clock — the last stage simply stays active until completion.
+const ANALYSIS_STAGES = {
+  extract: [
+    { at: 0,  label: 'Fetching latest merchant data from WebXPay…' },
+    { at: 6,  label: 'Downloading uploaded documents from storage…' },
+    { at: 40, label: 'Google AI is reading the documents (OCR & extraction)…' },
+    { at: 95, label: 'Cross-checking extracted data against the system record…' },
+  ],
+  verify: [
+    { at: 0, label: 'Fetching latest merchant data from WebXPay…' },
+    { at: 4, label: 'Cross-checking cached extraction against the system record…' },
+  ],
+};
+
+function AnalysisProgress({ mode }) {
+  const [elapsed, setElapsed] = useState(0);
+
+  useEffect(() => {
+    const timer = setInterval(() => setElapsed((e) => e + 1), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const stages = ANALYSIS_STAGES[mode] || ANALYSIS_STAGES.verify;
+  const currentIdx = stages.reduce((acc, stage, i) => (elapsed >= stage.at ? i : acc), 0);
+  const minutes = Math.floor(elapsed / 60);
+  const seconds = String(elapsed % 60).padStart(2, '0');
+
+  return (
+    <div className="analysis-progress">
+      <div className="analysis-progress-top">
+        <span className="analysis-spinner" />
+        <span className="analysis-progress-title">
+          {mode === 'extract' ? 'Re-extracting documents with Google AI' : 'Sync & Verify in progress'}
+        </span>
+        <span className="analysis-progress-elapsed">{minutes}:{seconds}</span>
+      </div>
+      <ul className="analysis-progress-steps">
+        {stages.map((stage, i) => (
+          <li
+            key={stage.label}
+            className={`analysis-step ${i < currentIdx ? 'analysis-step--done' : i === currentIdx ? 'analysis-step--active' : 'analysis-step--pending'}`}
+          >
+            <span className="analysis-step-mark">{i < currentIdx ? '✓' : i === currentIdx ? '●' : '○'}</span>
+            {stage.label}
+          </li>
+        ))}
+      </ul>
+      <div className="analysis-progress-note">
+        {mode === 'extract'
+          ? 'A fresh AI extraction typically takes 1–3 minutes; large documents on slow connections can take longer. You can stay on this page — results appear automatically.'
+          : 'This usually finishes in under 30 seconds.'}
+      </div>
+    </div>
+  );
+}
+
+// Browse & open every document the merchant uploaded, directly in the UI.
+function UploadedDocumentsCard({ documents = [], onView }) {
+  if (!documents.length) return null;
+
+  // The same physical file is listed under multiple sources (e.g. bank statement
+  // under signup_document AND bank_account) — show each file once.
+  const seen = new Set();
+  const uniqueDocs = documents.filter((doc) => {
+    const key = String(doc.url || doc.path || doc.label || '').split('?')[0];
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  return (
+    <div className="card">
+      <div className="card-header">
+        <span className="card-title">
+          <span className="card-title-accent" />
+          Uploaded Documents
+        </span>
+        <span className="card-badge">{uniqueDocs.length} file{uniqueDocs.length === 1 ? '' : 's'}</span>
+      </div>
+      <div className="uploaded-docs-grid">
+        {uniqueDocs.map((doc, i) => {
+          const label = String(doc.label || doc.document_name || 'Document').replace(/_/g, ' ');
+          const isPdf = String(doc.url || doc.path || '').split('?')[0].toLowerCase().endsWith('.pdf');
+          return (
+            <button
+              key={`${label}-${i}`}
+              type="button"
+              className="uploaded-doc-tile"
+              onClick={() => onView(doc)}
+              title={`View ${label}`}
+            >
+              <span className="uploaded-doc-icon">
+                {isPdf ? (
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>
+                  </svg>
+                ) : (
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/>
+                  </svg>
+                )}
+              </span>
+              <span className="uploaded-doc-label">{label}</span>
+              {doc.source && <span className="uploaded-doc-source">{String(doc.source).replace(/_/g, ' ')}</span>}
+              <span className="uploaded-doc-open">View →</span>
+            </button>
+          );
+        })}
       </div>
     </div>
   );
@@ -1010,16 +1456,22 @@ export default function MerchantAnalysis() {
   const [documentJson, setDocumentJson] = useState('');
   const [systemJson, setSystemJson] = useState('');
   const [overrides, setOverrides] = useState([]);
+  const [corrections, setCorrections] = useState([]);
+  const [stakeholderDupes, setStakeholderDupes] = useState(null);
+  const [loadingDupes, setLoadingDupes] = useState(false);
   const [dashStats, setDashStats] = useState(null);
   const [activeFilter, setActiveFilter] = useState(null);
   const [loadingMerchants, setLoadingMerchants] = useState(true);
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [running, setRunning] = useState(false);
+  const [runningMode, setRunningMode] = useState('verify');
+  const [viewerDoc, setViewerDoc] = useState(null);
   const [autoRunning, setAutoRunning] = useState(false);
   const [statusBusy, setStatusBusy] = useState(false);
   const [message, setMessage] = useState({ text: '', type: '' });
   const searchTimer = useRef(null);
   const location = useLocation();
+  const [searchParams, setSearchParams] = useSearchParams();
 
   const allDocuments = useMemo(() => {
     if (!systemJson) return [];
@@ -1028,6 +1480,11 @@ export default function MerchantAnalysis() {
       return parsed?.data?.all_documents || [];
     } catch { return []; }
   }, [systemJson]);
+
+  const effectiveReport = useMemo(
+    () => applyEffectiveDecisionToReport(report, overrides, corrections),
+    [report, overrides, corrections]
+  );
 
   const loadDashStats = useCallback(async () => {
     try {
@@ -1073,19 +1530,30 @@ export default function MerchantAnalysis() {
     setReport(null);
     setDocumentJson('');
     setSystemJson('');
+    setCorrections([]);
+    setStakeholderDupes(null);
     setMessage({ text: '', type: '' });
     setLoadingDetail(true);
+
+    // Cross-business stakeholder check — runs independently; the first call may
+    // build the server-side index, so it can take a moment.
+    setLoadingDupes(true);
+    api.get(`/onboard-verification/duplicate-stakeholders/${encodeURIComponent(merchant.mid)}`)
+      .then(({ data }) => setStakeholderDupes(data))
+      .catch(() => setStakeholderDupes({ matches: [] }))
+      .finally(() => setLoadingDupes(false));
 
     // Always fetch DB merchant info so type/channel/name are populated even on direct MID search
     const needsDbInfo = !merchant.merchant_type_name || !merchant.merchant_channel;
 
-    const [analysisResult, systemResult, merchantInfoResult, overridesResult] = await Promise.allSettled([
+    const [analysisResult, systemResult, merchantInfoResult, overridesResult, correctionsResult] = await Promise.allSettled([
       api.get(`/onboard-verification/latest-analysis/${encodeURIComponent(merchant.mid)}`),
       api.get(`/onboard-verification/external-merchant/${encodeURIComponent(merchant.mid)}`),
       needsDbInfo
         ? api.get(`/onboard-verification/merchant/${encodeURIComponent(merchant.mid)}`)
         : Promise.resolve(null),
       api.get(`/onboard-verification/rule-overrides/${encodeURIComponent(merchant.mid)}`),
+      api.get(`/onboard-verification/extraction-corrections/${encodeURIComponent(merchant.mid)}`),
     ]);
 
     // Populate type/channel from DB
@@ -1146,6 +1614,11 @@ export default function MerchantAnalysis() {
         ? overridesResult.value.data
         : []
     );
+    setCorrections(
+      correctionsResult.status === 'fulfilled' && Array.isArray(correctionsResult.value.data)
+        ? correctionsResult.value.data
+        : []
+    );
 
     setLoadingDetail(false);
   };
@@ -1177,6 +1650,8 @@ export default function MerchantAnalysis() {
     setDocumentJson('');
     setSystemJson('');
     setOverrides([]);
+    setCorrections([]);
+    setStakeholderDupes(null);
     setMessage({ text: '', type: '' });
   };
 
@@ -1184,12 +1659,8 @@ export default function MerchantAnalysis() {
     if (!selectedMerchant?.mid) return;
 
     setRunning(true);
-    setMessage({
-      text: forceReExtract
-        ? 'Re-running Google AI document extraction (this may take a moment)...'
-        : 'Re-verifying with latest system data (using cached document extraction)...',
-      type: '',
-    });
+    setRunningMode(forceReExtract ? 'extract' : 'verify');
+    setMessage({ text: '', type: '' });
     try {
       const response = await api.post(`/onboard-verification/verify-mid/${encodeURIComponent(selectedMerchant.mid)}`, {
         merchant_type_id: selectedMerchant.merchant_type_id,
@@ -1224,6 +1695,10 @@ export default function MerchantAnalysis() {
         const { data: ov } = await api.get(`/onboard-verification/rule-overrides/${encodeURIComponent(selectedMerchant.mid)}`);
         setOverrides(Array.isArray(ov) ? ov : []);
       } catch { setOverrides([]); }
+      try {
+        const { data: corr } = await api.get(`/onboard-verification/extraction-corrections/${encodeURIComponent(selectedMerchant.mid)}`);
+        setCorrections(Array.isArray(corr) ? corr : []);
+      } catch { setCorrections([]); }
       loadDashStats();
       const modeNote = response.data.usedCachedExtraction
         ? 'Cached document extraction used — results are consistent.'
@@ -1238,6 +1713,52 @@ export default function MerchantAnalysis() {
       setRunning(false);
     }
   };
+
+  const patchReportRow = useCallback((row, newAiValue) => {
+    setReport((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        unifiedRows: (prev.unifiedRows || []).map((r) => (
+          r.field === (row.field || '') && (r.document || '') === (row.document || '')
+            ? { ...r, aiValue: newAiValue }
+            : r
+        )),
+      };
+    });
+  }, []);
+
+  const handleSaveCorrection = useCallback(async (row, newValue) => {
+    if (!selectedMerchant?.mid) return;
+    try {
+      const { data } = await api.post('/onboard-verification/extraction-corrections', {
+        mid: selectedMerchant.mid,
+        field_name: row.field || '',
+        document_source: row.document || '',
+        old_value: row.aiValue === '—' ? null : row.aiValue,
+        new_value: newValue,
+      });
+      setCorrections(Array.isArray(data) ? data : []);
+      patchReportRow(row, newValue);
+      setMessage({ text: `"${row.field}" corrected. Click Sync & Verify to refresh the full report.`, type: 'success' });
+    } catch (err) {
+      setMessage({ text: err.response?.data?.message || 'Failed to save correction.', type: 'error' });
+    }
+  }, [selectedMerchant, patchReportRow]);
+
+  const handleDeleteCorrection = useCallback(async (correction) => {
+    if (!selectedMerchant?.mid || !correction?.id) return;
+    try {
+      const { data } = await api.delete(`/onboard-verification/extraction-corrections/${correction.id}?mid=${encodeURIComponent(selectedMerchant.mid)}`);
+      setCorrections(Array.isArray(data) ? data : []);
+      if (correction.old_value != null) {
+        patchReportRow({ field: correction.field_name, document: correction.document_source }, correction.old_value);
+      }
+      setMessage({ text: 'Correction removed. Click Sync & Verify to refresh the full report.', type: 'success' });
+    } catch (err) {
+      setMessage({ text: err.response?.data?.message || 'Failed to remove correction.', type: 'error' });
+    }
+  }, [selectedMerchant, patchReportRow]);
 
   const triggerAutoRun = async () => {
     setAutoRunning(true);
@@ -1265,20 +1786,52 @@ export default function MerchantAnalysis() {
         ...overrideData,
       });
       setOverrides(Array.isArray(data) ? data : []);
+      const latest = await api.get(`/onboard-verification/latest-analysis/${encodeURIComponent(selectedMerchant.mid)}`);
+      const latestData = latest.data || {};
+      setSelectedMerchant((prev) => ({
+        ...prev,
+        satisfaction_score: latestData.satisfaction_score ?? prev.satisfaction_score,
+        can_onboard: latestData.can_onboard ?? prev.can_onboard,
+        computed_status: latestData.computed_status ?? prev.computed_status,
+        review_status: latestData.review_status ?? prev.review_status,
+        effective_status: latestData.effective_status ?? latestData.review_status ?? latestData.computed_status ?? prev.effective_status,
+      }));
+      setMerchants((prev) => prev.map((m) => (
+        Number(m.mid) === Number(selectedMerchant.mid)
+          ? { ...m, satisfaction_score: latestData.satisfaction_score ?? m.satisfaction_score }
+          : m
+      )));
+      loadDashStats();
     } catch (err) {
       setMessage({ text: err.response?.data?.message || 'Failed to save override.', type: 'error' });
     }
-  }, [selectedMerchant]);
+  }, [selectedMerchant, loadDashStats]);
 
   const handleDeleteOverride = useCallback(async (id) => {
     if (!selectedMerchant?.mid) return;
     try {
       const { data } = await api.delete(`/onboard-verification/rule-overrides/${id}?mid=${encodeURIComponent(selectedMerchant.mid)}`);
       setOverrides(Array.isArray(data) ? data : []);
+      const latest = await api.get(`/onboard-verification/latest-analysis/${encodeURIComponent(selectedMerchant.mid)}`);
+      const latestData = latest.data || {};
+      setSelectedMerchant((prev) => ({
+        ...prev,
+        satisfaction_score: latestData.satisfaction_score ?? prev.satisfaction_score,
+        can_onboard: latestData.can_onboard ?? prev.can_onboard,
+        computed_status: latestData.computed_status ?? prev.computed_status,
+        review_status: latestData.review_status ?? prev.review_status,
+        effective_status: latestData.effective_status ?? latestData.review_status ?? latestData.computed_status ?? prev.effective_status,
+      }));
+      setMerchants((prev) => prev.map((m) => (
+        Number(m.mid) === Number(selectedMerchant.mid)
+          ? { ...m, satisfaction_score: latestData.satisfaction_score ?? m.satisfaction_score }
+          : m
+      )));
+      loadDashStats();
     } catch (err) {
       setMessage({ text: err.response?.data?.message || 'Failed to remove override.', type: 'error' });
     }
-  }, [selectedMerchant]);
+  }, [selectedMerchant, loadDashStats]);
 
   // Manually set the merchant's onboarding status (verified / caution / review),
   // or pass 'auto' to clear the override and fall back to the computed verdict.
@@ -1322,6 +1875,20 @@ export default function MerchantAnalysis() {
     loadMerchants('', 1);
     loadDashStats();
   }, [loadMerchants, loadDashStats, location]);
+
+  // Deep link from the navbar's stakeholder cross-business alert bell: ?mid=XXXX
+  // opens that merchant's detail view directly, without requiring a manual search.
+  useEffect(() => {
+    const midParam = searchParams.get('mid');
+    if (!midParam) return;
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.delete('mid');
+      return next;
+    }, { replace: true });
+    loadMerchantDetail({ mid: midParam });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
 
   return (
     <PageLayout>
@@ -1408,7 +1975,9 @@ export default function MerchantAnalysis() {
                 {selectedMerchant.merchant_business_name || selectedMerchant.mid}
               </span>
               {(() => {
-                const eff = effectiveStatusOf(selectedMerchant) || normalizeOnboardStatus(report?.status);
+                const eff = selectedMerchant.review_status
+                  ? effectiveStatusOf(selectedMerchant)
+                  : (normalizeOnboardStatus(effectiveReport?.status) || effectiveStatusOf(selectedMerchant));
                 if (!eff) return <StatusPill status={report?.status} label={report?.statusLabel} />;
                 const cfg = ONBOARD_STATUS[eff];
                 return (
@@ -1438,9 +2007,11 @@ export default function MerchantAnalysis() {
                 </div>
               </div>
 
-              {report && (
+              {effectiveReport && (
                 <ReviewStatusControl
-                  status={effectiveStatusOf(selectedMerchant) || normalizeOnboardStatus(report?.status)}
+                  status={selectedMerchant.review_status
+                    ? effectiveStatusOf(selectedMerchant)
+                    : (normalizeOnboardStatus(effectiveReport?.status) || effectiveStatusOf(selectedMerchant))}
                   isOverridden={Boolean(selectedMerchant.review_status)}
                   onSet={handleSetReviewStatus}
                   busy={statusBusy}
@@ -1470,15 +2041,22 @@ export default function MerchantAnalysis() {
                   {loadingDetail ? 'Loading...' : 'Reload'}
                 </button>
               </div>
+
+              {running && <AnalysisProgress mode={runningMode} />}
             </div>
           </div>
 
-          {report && (
+          {viewerDoc && <DocViewerModal doc={viewerDoc} onClose={() => setViewerDoc(null)} />}
+
+          <StakeholderCrossCheckCard data={stakeholderDupes} loading={loadingDupes} />
+
+          {effectiveReport && (
             <>
-              <VerificationSummary report={report} overrides={overrides} />
+              <VerificationSummary report={effectiveReport} overrides={overrides} />
+              <OnboardingDecisionCard decision={effectiveReport.onboardingDecision} />
               <RuleChecks
-                checks={report.ruleChecks}
-                report={report}
+                checks={effectiveReport.ruleChecks}
+                report={effectiveReport}
                 allDocuments={allDocuments}
                 mid={selectedMerchant.mid}
                 overrides={overrides}
@@ -1486,15 +2064,19 @@ export default function MerchantAnalysis() {
                 onDeleteOverride={handleDeleteOverride}
               />
               <UnifiedTable
-                rows={(report.unifiedRows || []).filter((row) => {
+                rows={(effectiveReport.unifiedRows || []).filter((row) => {
                   if (!['missing', 'mismatch', 'invalid'].includes(row.status)) return true;
                   return !overrides.some(
                     (ov) => ov.field_name === (row.field || '') && ov.document_source === (row.document || '—')
                   );
                 })}
                 allDocuments={allDocuments}
+                corrections={corrections}
+                onSaveCorrection={handleSaveCorrection}
+                onDeleteCorrection={handleDeleteCorrection}
               />
-              <DocumentChecksTable checks={report.documentChecks || []} overrides={overrides} allDocuments={allDocuments} />
+              <DocumentChecksTable checks={effectiveReport.documentChecks || []} overrides={overrides} allDocuments={allDocuments} />
+              <UploadedDocumentsCard documents={allDocuments} onView={setViewerDoc} />
             </>
           )}
 
@@ -1505,6 +2087,10 @@ export default function MerchantAnalysis() {
               </div>
             </div>
           )}
+
+          {/* Without a report there is no Document Validity section — still let
+              the reviewer browse the uploads. */}
+          {!report && <UploadedDocumentsCard documents={allDocuments} onView={setViewerDoc} />}
 
           <div className="card">
             <div className="card-header">

@@ -1,8 +1,14 @@
 const db = require('../config/db');
 
+// How many merchants are analyzed simultaneously. Each analysis spends most of
+// its time waiting on OpenAI / document downloads, so high parallelism is safe
+// for the Node process; tune down via env if OpenAI rate limits start biting.
+const CONCURRENCY = Math.max(1, Number(process.env.AUTO_RUN_CONCURRENCY) || 10);
+
 let isRunning = false;
 let lastRun = null;
 let lastResults = [];
+let progress = { done: 0, total: 0 };
 
 // Cached list of all MIDs from WebXPay — fetched once, reused until stale.
 let cachedMids = null;
@@ -109,19 +115,31 @@ const runAutoAnalysis = async (runFullAnalysisForMid) => {
   try {
     const webxpayMids = await loadAllMidsFromWebXPay();
     const mids = await getUnanalyzedMids(webxpayMids);
-    console.log(`[autoRun] ${mids.length} merchant(s) need analysis.`);
+    console.log(`[autoRun] ${mids.length} merchant(s) need analysis (concurrency: ${CONCURRENCY}).`);
 
+    progress = { done: 0, total: mids.length };
     const results = [];
-    for (const mid of mids) {
-      try {
-        console.log(`[autoRun] Analyzing MID: ${mid}`);
-        await runFullAnalysisForMid(mid);
-        results.push({ mid, status: 'success' });
-      } catch (err) {
-        console.error(`[autoRun] Failed MID: ${mid} — ${err.message}`);
-        results.push({ mid, status: 'error', error: err.message });
+    let nextIndex = 0;
+
+    // Worker pool: up to CONCURRENCY analyses in flight at once, each worker
+    // pulling the next MID as soon as it finishes its current one.
+    const worker = async () => {
+      while (nextIndex < mids.length) {
+        const mid = mids[nextIndex++];
+        try {
+          console.log(`[autoRun] Analyzing MID: ${mid}`);
+          await runFullAnalysisForMid(mid);
+          results.push({ mid, status: 'success' });
+        } catch (err) {
+          console.error(`[autoRun] Failed MID: ${mid} — ${err.message}`);
+          results.push({ mid, status: 'error', error: err.message });
+        }
+        progress.done += 1;
       }
-    }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(CONCURRENCY, mids.length) }, () => worker())
+    );
 
     const succeeded = results.filter((r) => r.status === 'success').length;
     const failed = results.filter((r) => r.status === 'error').length;
@@ -139,6 +157,7 @@ const runAutoAnalysis = async (runFullAnalysisForMid) => {
 const getAutoRunStatus = () => ({
   running: isRunning,
   lastRun,
+  progress,
   results: lastResults,
 });
 
