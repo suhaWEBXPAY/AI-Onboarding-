@@ -1576,8 +1576,9 @@ export default function MerchantAnalysis() {
       }));
       setMerchants(mapped);
       setMerchantMeta(data.meta || null);
-      // Only the unfiltered list reflects the full WebXPay merchant count.
-      if (!filter && data.meta?.total != null) setWebxpayTotal(data.meta.total);
+      // Only the unfiltered, unsearched list reflects the full WebXPay merchant
+      // count — a search returns its own (smaller) total.
+      if (!filter && !query && data.meta?.total != null) setWebxpayTotal(data.meta.total);
     } catch (err) {
       setMessage({ text: err.response?.data?.message || 'Failed to load merchants.', type: 'error' });
     } finally {
