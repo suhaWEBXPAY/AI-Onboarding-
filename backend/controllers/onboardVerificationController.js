@@ -417,6 +417,124 @@ const refreshAllOverrideAdjustedScores = async () => {
   await applyOverrideAdjustedScores(rows, { midField: 'mid' });
 };
 
+// ── Effective verdict (reviewer overrides + corrections applied) ─────────────
+// A reviewer can "Ignore" a blocking finding (merchant_rule_overrides) or correct
+// a misread value (extraction_corrections). Both must feed back into the persisted
+// verdict so the dashboard counts, the Status column, and the filters reflect the
+// effective review state — when every blocking issue is resolved the merchant
+// automatically becomes "verified" without waiting for a fresh analysis run.
+const normalizeDecisionKey = (value) => String(value ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
+const sameDecisionTarget = (leftField, leftDocument, rightField, rightDocument) => {
+  const lf = normalizeDecisionKey(leftField);
+  const rf = normalizeDecisionKey(rightField);
+  const ld = normalizeDecisionKey(leftDocument);
+  const rd = normalizeDecisionKey(rightDocument);
+  if (!lf || !rf || lf !== rf) return false;
+  if (!ld || !rd) return true;
+  return ld === rd || ld.includes(rd) || rd.includes(ld);
+};
+
+const issueHasManualResolution = (issue, overrides = [], corrections = []) => {
+  const field = issue.field || issue.title || '';
+  const documentSource = issue.document || '';
+  return overrides.some((ov) => sameDecisionTarget(field, documentSource, ov.field_name, ov.document_source))
+    || corrections.some((corr) => sameDecisionTarget(field, documentSource, corr.field_name, corr.document_source));
+};
+
+const computeRemainingBlockingIssues = (report, overrides = [], corrections = []) =>
+  (report?.onboardingDecision?.blockingIssues || [])
+    .filter((issue) => !issueHasManualResolution(issue, overrides, corrections));
+
+const getCorrectionsByMid = async (mids) => {
+  const uniqueMids = [...new Set((mids || []).map((mid) => String(mid || '').trim()).filter(Boolean))];
+  if (uniqueMids.length === 0) return new Map();
+  const map = new Map();
+  try {
+    await ensureCorrectionsTable();
+    const placeholders = uniqueMids.map(() => '?').join(',');
+    const [rows] = await db.query(
+      `SELECT mid, field_name, document_source FROM extraction_corrections WHERE mid IN (${placeholders})`,
+      uniqueMids
+    );
+    rows.forEach((row) => {
+      const key = String(row.mid);
+      if (!map.has(key)) map.set(key, []);
+      map.get(key).push(row);
+    });
+  } catch { /* corrections are best-effort */ }
+  return map;
+};
+
+// Recompute the persisted verdict for a set of rows that carry validation_json.
+// Mirrors applyOverrideAdjustedScores: mutates the rows in place and persists any
+// change so subsequent reads (dashboard stats, list filters) stay consistent.
+const applyEffectiveVerdicts = async (rows, { midField = 'mid', analysisIdField = 'analysis_id' } = {}) => {
+  if (!Array.isArray(rows) || rows.length === 0) return rows;
+
+  const mids = rows.map((row) => row?.[midField]);
+  const [overridesByMid, correctionsByMid] = await Promise.all([
+    getOverridesByMid(mids),
+    getCorrectionsByMid(mids),
+  ]);
+  const updates = [];
+
+  rows.forEach((row) => {
+    if (!row) return;
+    const mid = String(row[midField] || '').trim();
+    if (!mid || !row.validation_json) return;
+
+    const report = parseStoredJson(row.validation_json, {});
+    const originalBlocking = report?.onboardingDecision?.blockingIssues || [];
+    if (originalBlocking.length === 0) return; // engine verdict stands
+
+    const remaining = computeRemainingBlockingIssues(
+      report,
+      overridesByMid.get(mid) || [],
+      correctionsByMid.get(mid) || []
+    );
+    const status = remaining.length > 0 ? 'review_required' : 'verified';
+    const canOnboard = remaining.length > 0 ? 0 : 1;
+
+    if (row.computed_status !== status || Number(row.can_onboard) !== canOnboard) {
+      const analysisId = row[analysisIdField];
+      if (analysisId) {
+        updates.push(db.query(
+          'UPDATE merchant_document_json_data SET computed_status = ?, can_onboard = ? WHERE id = ?',
+          [status, canOnboard, analysisId]
+        ));
+      }
+    }
+    row.computed_status = status;
+    row.can_onboard = canOnboard;
+    if ('effective_status' in row) row.effective_status = row.review_status || status;
+  });
+
+  if (updates.length > 0) await Promise.all(updates);
+  return rows;
+};
+
+// Recompute + persist the effective verdict for one merchant's latest analysis.
+// Returns the effective state, or null when there is nothing to recompute.
+const refreshEffectiveVerdict = async (mid) => {
+  if (!mid) return null;
+  const [rows] = await db.query(
+    `SELECT id AS analysis_id, validation_json, computed_status, can_onboard, review_status
+     FROM merchant_document_json_data
+     WHERE mid = ?
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [mid]
+  );
+  if (rows.length === 0) return null;
+  rows[0].mid = mid;
+  await applyEffectiveVerdicts(rows, { midField: 'mid' });
+  return {
+    computed_status: rows[0].computed_status,
+    can_onboard: rows[0].can_onboard,
+  };
+};
+
 const normalizeSystemDataForVerification = (systemData) => {
   let normalizedSystemData = systemData;
   let uploadedDocNames = [];
@@ -678,6 +796,10 @@ const saveVerificationSnapshot = async ({ mid, merchantTypeName, documentData, r
         [mid || null, merchantTypeName, extractedJson, validationJson, canOnboard, satisfactionScore, computedStatus]
       );
     }
+
+    // Re-apply reviewer ignores/corrections so a re-run never flips a manually
+    // cleared merchant back to review_required.
+    if (mid) await refreshEffectiveVerdict(mid);
   } catch (err) {
     console.error('merchant_document_json_data upsert error:', err);
   }
@@ -788,6 +910,7 @@ const getLatestAnalysis = async (req, res) => {
     const row = rows[0];
     row.mid = mid;
     await applyOverrideAdjustedScores([row]);
+    await applyEffectiveVerdicts([row]);
     row.effective_status = row.review_status || row.computed_status || null;
     delete row.analysis_id;
     delete row.mid;
@@ -1112,6 +1235,17 @@ const getAutoRunStatusHandler = (req, res) => {
   return res.json(getAutoRunStatus());
 };
 
+const stopAutoRunHandler = (req, res) => {
+  const { stopAutoRun, getAutoRunStatus } = require('../services/autoRunService');
+  const accepted = stopAutoRun();
+  return res.json({
+    message: accepted
+      ? 'Stop requested. In-flight analyses will finish; queued merchants are skipped.'
+      : 'No auto-run is currently active.',
+    ...getAutoRunStatus(),
+  });
+};
+
 const getAiUsage = (req, res) => {
   const usage = getUsage();
   return res.json({
@@ -1131,6 +1265,77 @@ const fetchMerchantList = async (req, res) => {
   const VALID_FILTERS = ['analyzed', 'remaining', 'above50', 'below50', 'verified', 'caution', 'review'];
   // Effective status = human override if set, else the computed verdict.
   const EFFECTIVE_STATUS_SQL = 'COALESCE(mdjd.review_status, mdjd.computed_status)';
+
+  // Remaining = every WebXPay merchant without a completed analysis (status "Pending").
+  // The local-DB query below only knows merchants that were analyzed at least once,
+  // so it would miss WebXPay-only merchants; use the full (cached) WebXPay list.
+  if (filter === 'remaining') {
+    try {
+      const { loadAllMerchantsFromWebXPay } = require('../services/autoRunService');
+      const allMerchants = await loadAllMerchantsFromWebXPay();
+      if (allMerchants.length > 0) {
+        const [analyzedRows] = await db.query(
+          'SELECT DISTINCT mid FROM merchant_document_json_data WHERE can_onboard IS NOT NULL'
+        );
+        const analyzedSet = new Set(analyzedRows.map((r) => Number(r.mid)));
+        let pending = allMerchants.filter((m) => m?.id && !analyzedSet.has(Number(m.id)));
+
+        if (search) {
+          const q = search.toLowerCase();
+          pending = pending.filter((m) =>
+            String(m.id).includes(search)
+            || String(m.doing_business_name || '').toLowerCase().includes(q)
+            || String(m.registered_business_name || '').toLowerCase().includes(q));
+        }
+
+        const perPage = 15;
+        const total = pending.length;
+        const pageItems = pending.slice((page - 1) * perPage, page * perPage);
+
+        let enriched = pageItems;
+        if (pageItems.length > 0) {
+          const mids = pageItems.map((m) => m.id);
+          const placeholders = mids.map(() => '?').join(',');
+          const [dbRows] = await db.query(
+            `SELECT mi.mid, mi.merchant_channel, mt.name AS merchant_type_name
+             FROM merchant_information mi
+             LEFT JOIN merchant_types mt ON mt.id = mi.merchant_type_id
+             WHERE mi.mid IN (${placeholders})`,
+            mids
+          );
+          const dbMap = new Map(dbRows.map((r) => [Number(r.mid), r]));
+          enriched = pageItems.map((m) => {
+            const local = dbMap.get(Number(m.id)) || {};
+            return {
+              ...m,
+              merchant_channel:   local.merchant_channel   || null,
+              merchant_type_name: local.merchant_type_name || null,
+              can_onboard:        null,
+              satisfaction_score: null,
+              computed_status:    null,
+              review_status:      null,
+              effective_status:   null,
+              last_analysis_at:   null,
+            };
+          });
+        }
+
+        return res.json({
+          data: enriched,
+          meta: {
+            total,
+            per_page:     perPage,
+            current_page: page,
+            last_page:    Math.max(1, Math.ceil(total / perPage)),
+          },
+        });
+      }
+    } catch (err) {
+      console.warn('fetchMerchantList remaining-via-WebXPay failed, falling back to local DB:', err.message);
+    }
+    // fall through to the local-DB remaining query below
+  }
+
   if (filter && VALID_FILTERS.includes(filter)) {
     try {
       const perPage = 15;
@@ -1187,6 +1392,7 @@ const fetchMerchantList = async (req, res) => {
       );
 
       await applyOverrideAdjustedScores(rows, { midField: 'id' });
+      await applyEffectiveVerdicts(rows, { midField: 'id' });
       rows.forEach((row) => {
         delete row.analysis_id;
         delete row.validation_json;
@@ -1268,6 +1474,7 @@ const fetchMerchantList = async (req, res) => {
       );
 
       await applyOverrideAdjustedScores(dbRows, { midField: 'mid' });
+      await applyEffectiveVerdicts(dbRows, { midField: 'mid' });
 
       const dbMap = new Map();
       dbRows.forEach((row) => dbMap.set(Number(row.mid), row));
@@ -1537,6 +1744,7 @@ const saveRuleOverride = async (req, res) => {
       [mid, rule_check_name, field_name || '', document_source || '', comment.trim()]
     );
     await refreshOverrideAdjustedScore(mid);
+    await refreshEffectiveVerdict(mid);
     const [rows] = await db.query(
       `SELECT id, mid, rule_check_name, field_name, document_source, comment, created_at
        FROM merchant_rule_overrides
@@ -1573,6 +1781,7 @@ const getDashboardStats = async (req, res) => {
     `);
 
     await applyOverrideAdjustedScores(rows, { midField: 'mid' });
+    await applyEffectiveVerdicts(rows, { midField: 'mid' });
 
     const stats = rows.reduce((acc, row) => {
       const score = row.satisfaction_score == null ? null : Number(row.satisfaction_score);
@@ -1621,6 +1830,7 @@ const deleteRuleOverride = async (req, res) => {
     await db.query('DELETE FROM merchant_rule_overrides WHERE id = ?', [id]);
     if (mid) {
       await refreshOverrideAdjustedScore(mid);
+      await refreshEffectiveVerdict(mid);
       const [rows] = await db.query(
         `SELECT id, mid, rule_check_name, field_name, document_source, comment, created_at
          FROM merchant_rule_overrides
@@ -1658,12 +1868,35 @@ const updateReviewStatus = async (req, res) => {
 
   try {
     const [rows] = await db.query(
-      `SELECT id, computed_status FROM merchant_document_json_data WHERE mid = ? ORDER BY created_at DESC LIMIT 1`,
+      `SELECT id, computed_status, validation_json FROM merchant_document_json_data WHERE mid = ? ORDER BY created_at DESC LIMIT 1`,
       [mid]
     );
     if (rows.length === 0) {
       return res.status(404).json({ message: 'No analysis record for this merchant yet. Run analysis first.' });
     }
+
+    // A merchant cannot be manually marked Verified while blocking issues are
+    // still unresolved — each must be fixed or explicitly ignored with a reason.
+    if (reviewStatus === 'verified') {
+      const report = parseStoredJson(rows[0].validation_json, {});
+      const originalBlocking = report?.onboardingDecision?.blockingIssues || [];
+      if (originalBlocking.length > 0) {
+        const [overrides] = await db.query(
+          'SELECT field_name, document_source FROM merchant_rule_overrides WHERE mid = ?',
+          [mid]
+        );
+        const corrections = await loadCorrectionsForMid(mid).catch(() => []);
+        const remaining = computeRemainingBlockingIssues(report, overrides, corrections);
+        if (remaining.length > 0) {
+          const names = remaining.slice(0, 3).map((i) => i.field || i.title).filter(Boolean).join(', ');
+          return res.status(409).json({
+            message: `Cannot mark as Verified: ${remaining.length} blocking issue(s) are still unresolved${names ? ` (${names}${remaining.length > 3 ? ', …' : ''})` : ''}. Fix the data or ignore each issue with a documented reason first.`,
+            remaining_blocking: remaining.length,
+          });
+        }
+      }
+    }
+
     const by = req.user?.email || req.user?.username || req.user?.id || null;
     await db.query(
       `UPDATE merchant_document_json_data
@@ -1801,6 +2034,7 @@ const saveExtractionCorrection = async (req, res) => {
       [String(mid), String(field_name).slice(0, 255), String(document_source || '').slice(0, 255),
         old_value == null ? null : String(old_value), String(new_value), correctedBy]
     );
+    await refreshEffectiveVerdict(mid);
     return res.json(await loadCorrectionsForMid(mid));
   } catch (err) {
     console.error('saveExtractionCorrection error:', err);
@@ -1815,6 +2049,7 @@ const deleteExtractionCorrection = async (req, res) => {
   try {
     await ensureCorrectionsTable();
     await db.query('DELETE FROM extraction_corrections WHERE id = ?', [id]);
+    if (mid) await refreshEffectiveVerdict(mid);
     return res.json(await loadCorrectionsForMid(mid));
   } catch (err) {
     console.error('deleteExtractionCorrection error:', err);
@@ -1913,7 +2148,7 @@ module.exports = {
   getMerchant, deleteMerchant, deleteDocument,
   runDataVerification, fetchExternalMerchant, runAiAnalysis, getLatestAnalysis,
   runFullApiVerification, runFullAnalysisForMid,
-  triggerAutoRun, getAutoRunStatusHandler,
+  triggerAutoRun, getAutoRunStatusHandler, stopAutoRunHandler,
   getAiUsage, downloadMerchantDocuments, fetchMerchantList, getDashboardStats,
   getRuleOverrides, saveRuleOverride, deleteRuleOverride,
   updateReviewStatus, downloadVerificationReport, downloadAllIssuesReport,

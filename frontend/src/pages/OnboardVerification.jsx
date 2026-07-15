@@ -113,10 +113,15 @@ const buildEffectiveDecision = (report, overrides = [], corrections = []) => {
   const originalBlocking = decision.blockingIssues || [];
   if (originalBlocking.length === 0) return decision;
 
-  const remainingBlocking = originalBlocking.filter(
-    (issue) => !issueHasManualResolution(issue, overrides, corrections)
-  );
-  const resolvedCount = originalBlocking.length - remainingBlocking.length;
+  // Keep resolved issues around (flagged) so the UI can show them as solved
+  // instead of silently dropping them from the report.
+  const annotated = originalBlocking.map((issue) => ({
+    ...issue,
+    resolved: issueHasManualResolution(issue, overrides, corrections),
+  }));
+  const remainingBlocking = annotated.filter((issue) => !issue.resolved);
+  const resolvedIssues = annotated.filter((issue) => issue.resolved);
+  const resolvedCount = resolvedIssues.length;
   if (resolvedCount === 0) return decision;
 
   if (remainingBlocking.length === 0) {
@@ -127,6 +132,7 @@ const buildEffectiveDecision = (report, overrides = [], corrections = []) => {
       headline: 'Eligible for onboarding',
       summary: `${resolvedCount} blocking issue(s) were resolved or ignored with reviewer action. This merchant is now eligible for onboarding based on the effective review state.`,
       blockingIssues: [],
+      resolvedIssues,
       nextSteps: [],
       resolvedCount,
       effectiveReviewApplied: true,
@@ -140,6 +146,7 @@ const buildEffectiveDecision = (report, overrides = [], corrections = []) => {
     headline: 'Onboarding blocked',
     summary: `Onboarding is still blocked by ${remainingBlocking.length} issue(s). ${resolvedCount} issue(s) were resolved or ignored with reviewer action.`,
     blockingIssues: remainingBlocking,
+    resolvedIssues,
     nextSteps: [...new Set(remainingBlocking.map((issue) => issue.requiredAction).filter(Boolean))],
     resolvedCount,
     effectiveReviewApplied: true,
@@ -286,6 +293,10 @@ const toDisplayRow = (r) => ({
 });
 
 const getSolution = (item, ruleKey) => {
+  // Rows that carry their own remediation action (e.g. verdict blocking issues)
+  // display it directly instead of a heuristic suggestion.
+  if (item.solution) return item.solution;
+
   const field   = item.field    || 'this field';
   const doc     = (item.document && item.document !== '—') ? item.document : null;
   const comment = String(item.comment || '').toLowerCase();
@@ -324,13 +335,15 @@ const getSolution = (item, ruleKey) => {
 const getRuleItems = (check, report) => {
   if (!report) return [];
   if (check.isVerdict) {
-    return (report.onboardingDecision?.blockingIssues || []).map((issue) => ({
+    const decision = report.onboardingDecision || {};
+    return [...(decision.blockingIssues || []), ...(decision.resolvedIssues || [])].map((issue) => ({
       field:    issue.field,
       document: issue.document || '—',
       aiValue:  issue.documentValue || '—',
       apiValue: issue.systemValue || '—',
       comment:  `${issue.reason}${issue.policy ? ` ${issue.policy}` : ''}`,
-      solution: issue.requiredAction,
+      solution: issue.resolved ? '✓ Resolved — fixed or ignored by reviewer.' : issue.requiredAction,
+      resolved: !!issue.resolved,
     }));
   }
   const rows = report.unifiedRows || [];
@@ -381,9 +394,10 @@ function RuleCheckRow({ row, checkName, ruleKey, override, mid, allDocuments, on
   };
 
   const isOverridden = !!override;
+  const isResolved = !!row.resolved;
 
   return (
-    <tr className={isOverridden ? 'rule-row-overridden' : ''}>
+    <tr className={isOverridden || isResolved ? 'rule-row-overridden' : ''}>
       <td className="td-name">{formatCell(row.field)}</td>
       <td className="td-meta">
         <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
@@ -397,7 +411,7 @@ function RuleCheckRow({ row, checkName, ruleKey, override, mid, allDocuments, on
       <td className="td-value">{formatCell(row.aiValue)}</td>
       <td className="td-value">{formatCell(row.apiValue)}</td>
       <td><ExpandableComment text={formatCell(row.comment)} /></td>
-      <td className="rule-solution-cell" style={isOverridden ? { color: 'var(--ash)', fontStyle: 'italic' } : {}}>
+      <td className="rule-solution-cell" style={isOverridden || isResolved ? { color: 'var(--ash)', fontStyle: 'italic' } : {}}>
         {getSolution(row, ruleKey)}
       </td>
       {mid && (

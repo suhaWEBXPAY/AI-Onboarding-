@@ -105,10 +105,15 @@ const buildEffectiveDecision = (report, overrides = [], corrections = []) => {
   const originalBlocking = decision.blockingIssues || [];
   if (originalBlocking.length === 0) return decision;
 
-  const remainingBlocking = originalBlocking.filter(
-    (issue) => !issueHasManualResolution(issue, overrides, corrections)
-  );
-  const resolvedCount = originalBlocking.length - remainingBlocking.length;
+  // Keep resolved issues around (flagged) so the UI can show them as solved
+  // instead of silently dropping them from the report.
+  const annotated = originalBlocking.map((issue) => ({
+    ...issue,
+    resolved: issueHasManualResolution(issue, overrides, corrections),
+  }));
+  const remainingBlocking = annotated.filter((issue) => !issue.resolved);
+  const resolvedIssues = annotated.filter((issue) => issue.resolved);
+  const resolvedCount = resolvedIssues.length;
   if (resolvedCount === 0) return decision;
 
   if (remainingBlocking.length === 0) {
@@ -119,6 +124,7 @@ const buildEffectiveDecision = (report, overrides = [], corrections = []) => {
       headline: 'Eligible for onboarding',
       summary: `${resolvedCount} blocking issue(s) were resolved or ignored with reviewer action. This merchant is now eligible for onboarding based on the effective review state.`,
       blockingIssues: [],
+      resolvedIssues,
       nextSteps: [],
       resolvedCount,
       effectiveReviewApplied: true,
@@ -132,6 +138,7 @@ const buildEffectiveDecision = (report, overrides = [], corrections = []) => {
     headline: 'Onboarding blocked',
     summary: `Onboarding is still blocked by ${remainingBlocking.length} issue(s). ${resolvedCount} issue(s) were resolved or ignored with reviewer action.`,
     blockingIssues: remainingBlocking,
+    resolvedIssues,
     nextSteps: [...new Set(remainingBlocking.map((issue) => issue.requiredAction).filter(Boolean))],
     resolvedCount,
     effectiveReviewApplied: true,
@@ -553,14 +560,17 @@ const getRuleItems = (check, report) => {
 
   // The verdict row expands into the justified blocking issues: what blocked,
   // the evidence values, the policy rule violated, and the required action.
+  // Resolved/ignored issues stay listed (flagged) so the reviewer sees them solved.
   if (check.isVerdict) {
-    return (report.onboardingDecision?.blockingIssues || []).map((issue) => ({
+    const decision = report.onboardingDecision || {};
+    return [...(decision.blockingIssues || []), ...(decision.resolvedIssues || [])].map((issue) => ({
       field:    issue.field,
       document: issue.document || '—',
       aiValue:  issue.documentValue || '—',
       apiValue: issue.systemValue || '—',
       comment:  `${issue.reason}${issue.policy ? ` ${issue.policy}` : ''}`,
-      solution: issue.requiredAction,
+      solution: issue.resolved ? '✓ Resolved — fixed or ignored by reviewer.' : issue.requiredAction,
+      resolved: !!issue.resolved,
     }));
   }
 
@@ -623,9 +633,10 @@ function RuleCheckRow({ row, checkName, ruleKey, override, mid, allDocuments, on
   };
 
   const isOverridden = !!override;
+  const isResolved = !!row.resolved;
 
   return (
-    <tr className={isOverridden ? 'rule-row-overridden' : ''}>
+    <tr className={isOverridden || isResolved ? 'rule-row-overridden' : ''}>
       <td className="td-name">{formatCell(row.field)}</td>
       <td className="td-meta">
         <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
@@ -639,7 +650,7 @@ function RuleCheckRow({ row, checkName, ruleKey, override, mid, allDocuments, on
       <td className="td-value">{formatCell(row.aiValue)}</td>
       <td className="td-value">{formatCell(row.apiValue)}</td>
       <td><ExpandableComment text={formatCell(row.comment)} /></td>
-      <td className="rule-solution-cell" style={isOverridden ? { color: 'var(--ash)', fontStyle: 'italic' } : {}}>
+      <td className="rule-solution-cell" style={isOverridden || isResolved ? { color: 'var(--ash)', fontStyle: 'italic' } : {}}>
         {getSolution(row, ruleKey)}
       </td>
       {mid && (
@@ -935,6 +946,24 @@ function OnboardingDecisionCard({ decision }) {
           <p style={{ margin: '0 0 10px', fontSize: 12, color: 'var(--ash-2)' }}>
             Reviewer fixes/ignores are included in this effective decision.
           </p>
+        )}
+        {decision.resolvedIssues?.length > 0 && (
+          <div style={{ marginBottom: 12 }}>
+            <div className="form-label" style={{ marginBottom: 6 }}>
+              Resolved blocking issues ({decision.resolvedIssues.length})
+            </div>
+            <ul style={{ margin: 0, paddingLeft: 20, lineHeight: 1.6 }}>
+              {decision.resolvedIssues.map((issue, i) => (
+                <li key={i} style={{ color: 'var(--ash)' }}>
+                  <span className="unified-status-badge unified-status-badge--success" style={{ fontSize: 11, marginRight: 6 }}>✓ Solved</span>
+                  <span style={{ textDecoration: 'line-through' }}>
+                    {issue.field || issue.title}{issue.document ? ` — ${formatDocLabel(issue.document)}` : ''}
+                  </span>
+                  <span style={{ fontStyle: 'italic' }}> (fixed or ignored by reviewer)</span>
+                </li>
+              ))}
+            </ul>
+          </div>
         )}
         {blocked && decision.nextSteps?.length > 0 && (
           <>
@@ -1267,11 +1296,11 @@ const DASH_CARDS = [
   { key: 'below50',   label: 'Score < 50%',      tone: 'danger',   icon: '↓' },
 ];
 
-function DashboardStats({ stats, meta, activeFilter, onFilter }) {
-  const webxpayTotal = meta?.total ?? null;
-
+// webxpayTotal comes from the last UNFILTERED list load — using the current list
+// meta would corrupt the Total/Remaining cards as soon as a filter is active.
+function DashboardStats({ stats, webxpayTotal, activeFilter, onFilter }) {
   const getValue = (key) => {
-    if (key === null) return webxpayTotal;
+    if (key === null) return webxpayTotal ?? stats?.total ?? null;
     if (key === 'remaining') {
       // Remaining = WebXPay total − analyzed (more accurate than local-DB remaining)
       return webxpayTotal != null && stats?.analyzed != null
@@ -1305,7 +1334,7 @@ function DashboardStats({ stats, meta, activeFilter, onFilter }) {
 
 // Human-settable onboarding status. Lets a reviewer override the computed verdict
 // (e.g. confirm a flagged merchant as Verified, or downgrade one to Caution).
-function ReviewStatusControl({ status, isOverridden, onSet, busy }) {
+function ReviewStatusControl({ status, isOverridden, onSet, busy, verifyBlocked }) {
   const OPTIONS = ['verified', 'caution', 'review'];
   return (
     <div className="ma-status-control">
@@ -1314,20 +1343,28 @@ function ReviewStatusControl({ status, isOverridden, onSet, busy }) {
         {OPTIONS.map((key) => {
           const cfg = ONBOARD_STATUS[key];
           const active = status === key;
+          const blockedVerify = key === 'verified' && verifyBlocked;
           return (
             <button
               key={key}
               type="button"
               className={`ma-status-seg-btn ma-status-seg-btn--${cfg.tone}${active ? ' is-active' : ''}`}
               onClick={() => onSet(key)}
-              disabled={busy || active}
-              title={`Mark this merchant as ${cfg.label}`}
+              disabled={busy || active || blockedVerify}
+              title={blockedVerify
+                ? 'Cannot mark as Verified while blocking issues are unresolved — fix or ignore each one first.'
+                : `Mark this merchant as ${cfg.label}`}
             >
               {cfg.symbol} {cfg.label}
             </button>
           );
         })}
       </div>
+      {verifyBlocked && (
+        <span className="ma-status-origin" style={{ color: 'var(--ash)' }}>
+          Verified is locked until every blocking issue is fixed or ignored.
+        </span>
+      )}
       {isOverridden
         ? (
           <button type="button" className="ma-status-revert" onClick={() => onSet('auto')} disabled={busy} title="Discard the manual override and use the system-computed verdict">
@@ -1341,7 +1378,7 @@ function ReviewStatusControl({ status, isOverridden, onSet, busy }) {
   );
 }
 
-function MerchantTable({ merchants, loading, meta, page, onPageChange, onSelect }) {
+function MerchantTable({ merchants, loading, meta, page, onPageChange, onSelect, processingMids }) {
   const totalPages = meta ? meta.last_page : 1;
 
   return (
@@ -1393,6 +1430,7 @@ function MerchantTable({ merchants, loading, meta, page, onPageChange, onSelect 
               const effStatus = effectiveStatusOf(merchant);
               const statusCfg = effStatus ? ONBOARD_STATUS[effStatus] : null;
               const isOverridden = Boolean(merchant.review_status);
+              const isProcessing = processingMids?.has(Number(merchant.mid));
               return (
                 <tr
                   key={merchant.mid}
@@ -1410,7 +1448,15 @@ function MerchantTable({ merchants, loading, meta, page, onPageChange, onSelect 
                     }
                   </td>
                   <td style={{ textAlign: 'center' }}>
-                    {!statusCfg
+                    {isProcessing
+                      ? <span
+                          className="unified-status-badge unified-status-badge--sys"
+                          style={{ fontSize: 11, display: 'inline-flex', alignItems: 'center', gap: 5 }}
+                          title="Auto-run is analyzing this merchant right now"
+                        >
+                          <span className="docs-spinner" style={{ width: 10, height: 10 }} /> Processing…
+                        </span>
+                      : !statusCfg
                       ? <span className="unified-status-badge unified-status-badge--sys" style={{ fontSize: 11 }}>Pending</span>
                       : <span
                           className={`unified-status-badge unified-status-badge--${statusCfg.tone}`}
@@ -1460,6 +1506,7 @@ export default function MerchantAnalysis() {
   const [stakeholderDupes, setStakeholderDupes] = useState(null);
   const [loadingDupes, setLoadingDupes] = useState(false);
   const [dashStats, setDashStats] = useState(null);
+  const [webxpayTotal, setWebxpayTotal] = useState(null);
   const [activeFilter, setActiveFilter] = useState(null);
   const [loadingMerchants, setLoadingMerchants] = useState(true);
   const [loadingDetail, setLoadingDetail] = useState(false);
@@ -1467,6 +1514,9 @@ export default function MerchantAnalysis() {
   const [runningMode, setRunningMode] = useState('verify');
   const [viewerDoc, setViewerDoc] = useState(null);
   const [autoRunning, setAutoRunning] = useState(false);
+  const [autoRunStatus, setAutoRunStatus] = useState(null);
+  const autoRunResultsCount = useRef(0);
+  const autoRunStopRequested = useRef(false);
   const [statusBusy, setStatusBusy] = useState(false);
   const [message, setMessage] = useState({ text: '', type: '' });
   const searchTimer = useRef(null);
@@ -1486,6 +1536,12 @@ export default function MerchantAnalysis() {
     [report, overrides, corrections]
   );
 
+  // MIDs the background auto-run is analyzing right now — rows show a spinner.
+  const processingMids = useMemo(
+    () => new Set((autoRunning ? autoRunStatus?.currentMids || [] : []).map(Number)),
+    [autoRunning, autoRunStatus]
+  );
+
   const loadDashStats = useCallback(async () => {
     try {
       const { data } = await api.get('/onboard-verification/dashboard-stats');
@@ -1493,7 +1549,10 @@ export default function MerchantAnalysis() {
     } catch { /* silent — dashboard is non-critical */ }
   }, []);
 
+  const listParams = useRef({ query: '', pg: 1, filter: '' });
+
   const loadMerchants = useCallback(async (query, pg, filter = '') => {
+    listParams.current = { query, pg, filter };
     setLoadingMerchants(true);
     try {
       const params = { page: pg };
@@ -1517,12 +1576,53 @@ export default function MerchantAnalysis() {
       }));
       setMerchants(mapped);
       setMerchantMeta(data.meta || null);
+      // Only the unfiltered list reflects the full WebXPay merchant count.
+      if (!filter && data.meta?.total != null) setWebxpayTotal(data.meta.total);
     } catch (err) {
       setMessage({ text: err.response?.data?.message || 'Failed to load merchants.', type: 'error' });
     } finally {
       setLoadingMerchants(false);
     }
   }, []);
+
+  // Re-fetch the list exactly as the user currently sees it (same search/page/filter).
+  const reloadList = useCallback(() => {
+    const { query, pg, filter } = listParams.current;
+    loadMerchants(query, pg, filter);
+  }, [loadMerchants]);
+
+  // After any reviewer action (ignore/undo/correction), the backend recomputes
+  // the persisted verdict — pull it back so the header badge, the list row's
+  // Status column, and the dashboard cards all reflect the new effective state.
+  const refreshMerchantStatus = useCallback(async (mid) => {
+    try {
+      const latest = await api.get(`/onboard-verification/latest-analysis/${encodeURIComponent(mid)}`);
+      const latestData = latest.data || {};
+      setSelectedMerchant((prev) => (prev && Number(prev.mid) === Number(mid)
+        ? {
+          ...prev,
+          satisfaction_score: latestData.satisfaction_score ?? prev.satisfaction_score,
+          can_onboard: latestData.can_onboard ?? prev.can_onboard,
+          computed_status: latestData.computed_status ?? prev.computed_status,
+          review_status: latestData.review_status ?? null,
+          effective_status: latestData.effective_status ?? latestData.review_status ?? latestData.computed_status ?? prev.effective_status,
+        }
+        : prev));
+      setMerchants((prev) => prev.map((m) => (
+        Number(m.mid) === Number(mid)
+          ? {
+            ...m,
+            satisfaction_score: latestData.satisfaction_score ?? m.satisfaction_score,
+            can_onboard: latestData.can_onboard ?? m.can_onboard,
+            computed_status: latestData.computed_status ?? m.computed_status,
+            review_status: latestData.review_status ?? null,
+            effective_status: latestData.effective_status ?? latestData.review_status ?? latestData.computed_status ?? m.effective_status,
+          }
+          : m
+      )));
+    } catch { /* best-effort — the detail view still shows the client-side effective state */ }
+    loadDashStats();
+  }, [loadDashStats]);
 
   const loadMerchantDetail = async (merchant) => {
     if (!merchant?.mid) return;
@@ -1699,7 +1799,9 @@ export default function MerchantAnalysis() {
         const { data: corr } = await api.get(`/onboard-verification/extraction-corrections/${encodeURIComponent(selectedMerchant.mid)}`);
         setCorrections(Array.isArray(corr) ? corr : []);
       } catch { setCorrections([]); }
-      loadDashStats();
+      // The persisted verdict may differ from report.status once reviewer
+      // ignores/corrections are applied server-side — sync from the DB.
+      await refreshMerchantStatus(selectedMerchant.mid);
       const modeNote = response.data.usedCachedExtraction
         ? 'Cached document extraction used — results are consistent.'
         : 'Fresh AI extraction completed.';
@@ -1740,11 +1842,12 @@ export default function MerchantAnalysis() {
       });
       setCorrections(Array.isArray(data) ? data : []);
       patchReportRow(row, newValue);
+      await refreshMerchantStatus(selectedMerchant.mid);
       setMessage({ text: `"${row.field}" corrected. Click Sync & Verify to refresh the full report.`, type: 'success' });
     } catch (err) {
       setMessage({ text: err.response?.data?.message || 'Failed to save correction.', type: 'error' });
     }
-  }, [selectedMerchant, patchReportRow]);
+  }, [selectedMerchant, patchReportRow, refreshMerchantStatus]);
 
   const handleDeleteCorrection = useCallback(async (correction) => {
     if (!selectedMerchant?.mid || !correction?.id) return;
@@ -1754,15 +1857,24 @@ export default function MerchantAnalysis() {
       if (correction.old_value != null) {
         patchReportRow({ field: correction.field_name, document: correction.document_source }, correction.old_value);
       }
+      await refreshMerchantStatus(selectedMerchant.mid);
       setMessage({ text: 'Correction removed. Click Sync & Verify to refresh the full report.', type: 'success' });
     } catch (err) {
       setMessage({ text: err.response?.data?.message || 'Failed to remove correction.', type: 'error' });
     }
-  }, [selectedMerchant, patchReportRow]);
+  }, [selectedMerchant, patchReportRow, refreshMerchantStatus]);
 
   const triggerAutoRun = async () => {
+    // Analyzing a merchant costs AI budget — confirm before launching a big batch.
+    const remainingCount = webxpayTotal != null && dashStats?.analyzed != null
+      ? Math.max(0, webxpayTotal - dashStats.analyzed)
+      : dashStats?.remaining;
+    if (remainingCount > 0 && !window.confirm(
+      `Auto-run will analyze ${remainingCount.toLocaleString()} pending merchant(s) with AI. This may take a long time and consume AI budget. Continue?`
+    )) return;
+
     setAutoRunning(true);
-    setMessage({ text: 'Triggering auto-analysis for unanalyzed merchants...', type: '' });
+    setMessage({ text: 'Triggering auto-analysis for pending merchants...', type: '' });
     try {
       const response = await api.post('/onboard-verification/auto-run');
       const { message: serverMsg, running } = response.data;
@@ -1771,12 +1883,81 @@ export default function MerchantAnalysis() {
         type: 'success',
       });
       loadDashStats();
+      // Leave autoRunning true — the polling effect below tracks the background
+      // run and flips it off (with a final refresh) when the run completes.
     } catch (err) {
       setMessage({ text: err.response?.data?.message || 'Auto-run failed.', type: 'error' });
-    } finally {
       setAutoRunning(false);
     }
   };
+
+  const stopAutoRun = async () => {
+    try {
+      const { data } = await api.post('/onboard-verification/auto-run/stop');
+      autoRunStopRequested.current = true;
+      setAutoRunStatus(data);
+      setMessage({ text: data.message, type: 'success' });
+      // Polling keeps going until the in-flight analyses drain and running=false.
+    } catch (err) {
+      setMessage({ text: err.response?.data?.message || 'Failed to stop the auto-run.', type: 'error' });
+    }
+  };
+
+  // While an auto-run is active, poll its status so the UI can show which
+  // merchants are being processed and refresh rows/stats as verdicts land.
+  useEffect(() => {
+    if (!autoRunning) return undefined;
+    let cancelled = false;
+    let timer = null;
+
+    const tick = async () => {
+      try {
+        const { data } = await api.get('/onboard-verification/auto-run-status');
+        if (cancelled) return;
+        setAutoRunStatus(data);
+
+        const completed = (data.results || []).length;
+        if (completed !== autoRunResultsCount.current) {
+          autoRunResultsCount.current = completed;
+          loadDashStats();
+          reloadList();
+        }
+
+        if (!data.running) {
+          setAutoRunning(false);
+          const ok = (data.results || []).filter((r) => r.status === 'success').length;
+          const bad = (data.results || []).filter((r) => r.status === 'error').length;
+          const stopped = autoRunStopRequested.current;
+          autoRunStopRequested.current = false;
+          setMessage({
+            text: `Auto-run ${stopped ? 'stopped' : 'complete'}: ${ok} analyzed${bad ? `, ${bad} failed` : ''}${stopped ? ', remaining merchants skipped' : ''}.`,
+            type: bad ? 'error' : 'success',
+          });
+          loadDashStats();
+          reloadList();
+          return;
+        }
+      } catch { /* transient — keep polling */ }
+      timer = setTimeout(tick, 4000);
+    };
+
+    tick();
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [autoRunning, loadDashStats, reloadList]);
+
+  // If an auto-run is already in progress when the page opens (started earlier or
+  // by the daily cron), resume showing its progress instead of appearing idle.
+  useEffect(() => {
+    api.get('/onboard-verification/auto-run-status')
+      .then(({ data }) => {
+        setAutoRunStatus(data);
+        if (data.running) {
+          autoRunResultsCount.current = (data.results || []).length;
+          setAutoRunning(true);
+        }
+      })
+      .catch(() => { /* status is cosmetic */ });
+  }, []);
 
   const handleSaveOverride = useCallback(async (overrideData) => {
     if (!selectedMerchant?.mid) return;
@@ -1786,52 +1967,22 @@ export default function MerchantAnalysis() {
         ...overrideData,
       });
       setOverrides(Array.isArray(data) ? data : []);
-      const latest = await api.get(`/onboard-verification/latest-analysis/${encodeURIComponent(selectedMerchant.mid)}`);
-      const latestData = latest.data || {};
-      setSelectedMerchant((prev) => ({
-        ...prev,
-        satisfaction_score: latestData.satisfaction_score ?? prev.satisfaction_score,
-        can_onboard: latestData.can_onboard ?? prev.can_onboard,
-        computed_status: latestData.computed_status ?? prev.computed_status,
-        review_status: latestData.review_status ?? prev.review_status,
-        effective_status: latestData.effective_status ?? latestData.review_status ?? latestData.computed_status ?? prev.effective_status,
-      }));
-      setMerchants((prev) => prev.map((m) => (
-        Number(m.mid) === Number(selectedMerchant.mid)
-          ? { ...m, satisfaction_score: latestData.satisfaction_score ?? m.satisfaction_score }
-          : m
-      )));
-      loadDashStats();
+      await refreshMerchantStatus(selectedMerchant.mid);
     } catch (err) {
       setMessage({ text: err.response?.data?.message || 'Failed to save override.', type: 'error' });
     }
-  }, [selectedMerchant, loadDashStats]);
+  }, [selectedMerchant, refreshMerchantStatus]);
 
   const handleDeleteOverride = useCallback(async (id) => {
     if (!selectedMerchant?.mid) return;
     try {
       const { data } = await api.delete(`/onboard-verification/rule-overrides/${id}?mid=${encodeURIComponent(selectedMerchant.mid)}`);
       setOverrides(Array.isArray(data) ? data : []);
-      const latest = await api.get(`/onboard-verification/latest-analysis/${encodeURIComponent(selectedMerchant.mid)}`);
-      const latestData = latest.data || {};
-      setSelectedMerchant((prev) => ({
-        ...prev,
-        satisfaction_score: latestData.satisfaction_score ?? prev.satisfaction_score,
-        can_onboard: latestData.can_onboard ?? prev.can_onboard,
-        computed_status: latestData.computed_status ?? prev.computed_status,
-        review_status: latestData.review_status ?? prev.review_status,
-        effective_status: latestData.effective_status ?? latestData.review_status ?? latestData.computed_status ?? prev.effective_status,
-      }));
-      setMerchants((prev) => prev.map((m) => (
-        Number(m.mid) === Number(selectedMerchant.mid)
-          ? { ...m, satisfaction_score: latestData.satisfaction_score ?? m.satisfaction_score }
-          : m
-      )));
-      loadDashStats();
+      await refreshMerchantStatus(selectedMerchant.mid);
     } catch (err) {
       setMessage({ text: err.response?.data?.message || 'Failed to remove override.', type: 'error' });
     }
-  }, [selectedMerchant, loadDashStats]);
+  }, [selectedMerchant, refreshMerchantStatus]);
 
   // Manually set the merchant's onboarding status (verified / caution / review),
   // or pass 'auto' to clear the override and fall back to the computed verdict.
@@ -1932,10 +2083,26 @@ export default function MerchantAnalysis() {
           type="button"
           onClick={triggerAutoRun}
           disabled={autoRunning}
-          title="Run analysis for newly onboarded merchants today"
+          title="Analyze every merchant that has no completed verdict yet (Pending status)"
         >
-          {autoRunning ? 'Running…' : 'Auto-Run'}
+          {autoRunning
+            ? (autoRunStatus?.progress?.total
+              ? `Running… ${autoRunStatus.progress.done}/${autoRunStatus.progress.total}`
+              : 'Running…')
+            : 'Auto-Run'}
         </button>
+        {autoRunning && (
+          <button
+            className="btn btn-secondary"
+            type="button"
+            onClick={stopAutoRun}
+            disabled={autoRunStatus?.stopping}
+            title="Stop the auto-run — analyses already in progress finish, queued merchants are skipped"
+            style={{ color: 'var(--danger, #b91c1c)' }}
+          >
+            {autoRunStatus?.stopping ? 'Stopping…' : '■ Stop'}
+          </button>
+        )}
       </div>
 
       {message.text && (
@@ -1949,7 +2116,7 @@ export default function MerchantAnalysis() {
         <>
           <DashboardStats
             stats={dashStats}
-            meta={merchantMeta}
+            webxpayTotal={webxpayTotal}
             activeFilter={activeFilter}
             onFilter={handleFilterClick}
           />
@@ -1960,6 +2127,7 @@ export default function MerchantAnalysis() {
             page={merchantPage}
             onPageChange={handlePageChange}
             onSelect={loadMerchantDetail}
+            processingMids={processingMids}
           />
         </>
       )}
@@ -2015,6 +2183,7 @@ export default function MerchantAnalysis() {
                   isOverridden={Boolean(selectedMerchant.review_status)}
                   onSet={handleSetReviewStatus}
                   busy={statusBusy}
+                  verifyBlocked={Boolean(effectiveReport?.onboardingDecision && !effectiveReport.onboardingDecision.canOnboard)}
                 />
               )}
 

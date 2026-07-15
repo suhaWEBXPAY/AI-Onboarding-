@@ -9,7 +9,7 @@ const {
   getMerchant, deleteMerchant, deleteDocument,
   runDataVerification, fetchExternalMerchant, runAiAnalysis, getLatestAnalysis,
   runFullApiVerification, getAiUsage,
-  triggerAutoRun, getAutoRunStatusHandler,
+  triggerAutoRun, getAutoRunStatusHandler, stopAutoRunHandler,
   downloadMerchantDocuments, fetchMerchantList, getDashboardStats,
   getRuleOverrides, saveRuleOverride, deleteRuleOverride,
   updateReviewStatus, downloadVerificationReport, downloadAllIssuesReport,
@@ -45,6 +45,7 @@ router.get('/latest-analysis/:mid',        protect, getLatestAnalysis);
 router.get('/ai-usage',                    protect, getAiUsage);
 router.post('/auto-run',                   protect, triggerAutoRun);
 router.get('/auto-run-status',             protect, getAutoRunStatusHandler);
+router.post('/auto-run/stop',              protect, stopAutoRunHandler);
 router.get('/download-documents/:mid',     protect, downloadMerchantDocuments);
 router.get('/download-report/:mid',        protect, downloadVerificationReport);
 router.get('/download-issues-report',      protect, downloadAllIssuesReport);
