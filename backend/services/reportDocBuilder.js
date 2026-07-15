@@ -201,15 +201,22 @@ const buildVerificationReportDoc = async ({ merchant = {}, analysis = {}, report
   if (decision?.summary) {
     blocks.push(heading('Decision Justification'));
     blocks.push(para([new TextRun({ text: decision.summary, size: 20, color: COLOR.ink })]));
-    if (Array.isArray(decision.blockingIssues) && decision.blockingIssues.length) {
+    const openIssues = Array.isArray(decision.blockingIssues) ? decision.blockingIssues : [];
+    const resolvedIssues = Array.isArray(decision.resolvedIssues) ? decision.resolvedIssues : [];
+    if (openIssues.length || resolvedIssues.length) {
       blocks.push(buildTable(
         ['#', 'Blocking Issue', 'Evidence / Reason', 'Required Action'],
-        decision.blockingIssues.map((issue, i) => [
-          { value: String(i + 1), bold: true },
-          { value: issue.title || issue.field || '—', bold: true, color: COLOR.red },
-          `${issue.reason || '—'}${issue.policy ? `\n${issue.policy}` : ''}`,
-          issue.requiredAction || '—',
-        ]),
+        [...openIssues, ...resolvedIssues].map((issue, i) => {
+          const resolved = Boolean(issue.resolved);
+          return [
+            { value: String(i + 1), bold: true },
+            { value: `${resolved ? '✓ ' : ''}${issue.title || issue.field || '—'}`, bold: true, color: resolved ? COLOR.green : COLOR.red },
+            { value: `${issue.reason || '—'}${issue.policy ? `\n${issue.policy}` : ''}`, color: resolved ? COLOR.grey : COLOR.ink },
+            resolved
+              ? { value: 'Resolved — fixed or ignored by reviewer.', color: COLOR.green, bold: true }
+              : (issue.requiredAction || '—'),
+          ];
+        }),
         [5, 25, 42, 28]
       ));
     }
@@ -342,21 +349,38 @@ const humanize = (raw) => {
   return t;
 };
 
+// Loose field/document matcher — same normalization the controller and UI use
+// to decide whether a reviewer action (ignore/correction) resolves an issue.
+const normResKey = (v) => String(v ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+const hasManualResolution = (field, docName, overrides = [], corrections = []) => {
+  const check = (rf, rd) => {
+    const a = normResKey(field); const b = normResKey(rf);
+    if (!a || !b || a !== b) return false;
+    const c = normResKey(docName); const d = normResKey(rd);
+    if (!c || !d) return true;
+    return c === d || c.includes(d) || d.includes(c);
+  };
+  return overrides.some((ov) => check(ov.field_name, ov.document_source))
+    || corrections.some((corr) => check(corr.field_name, corr.document_source));
+};
+
 // Collect every open, actionable issue for one merchant from its stored report,
 // worded for a non-technical reader. Missing OPTIONAL documents are returned
 // separately (they are informational, not problems to fix). Manually ignored
 // failures are excluded.
-const collectMerchantIssues = (report = {}, overrides = []) => {
+const collectMerchantIssues = (report = {}, overrides = [], corrections = []) => {
   const issues = [];
   const optionalMissing = [];
   const isIgnored = (field, docName) => overrides.some(
     (ov) => (ov.field_name || '') === (field || '') && (ov.document_source || '') === (docName || '—')
   );
 
-  // 1. Missing / invalid documents.
+  // 1. Missing / invalid documents. A reviewer ignore on the document-level
+  // blocking issue resolves these too.
   const documentChecks = Array.isArray(report.documentChecks) ? report.documentChecks : [];
   for (const d of documentChecks) {
     const name = cleanDocName(d.name) || 'Document';
+    if (hasManualResolution(d.name, d.name, overrides, corrections)) continue;
     if (!d.present) {
       if (!d.isMandatory) { optionalMissing.push(name); continue; }
       issues.push({
@@ -378,10 +402,13 @@ const collectMerchantIssues = (report = {}, overrides = []) => {
   }
 
   // 2. Blocking issues from the onboarding decision (already carry an action).
+  // Reports patched by applyEffectiveDecisionToStoredReport contain only the
+  // remaining (unresolved) ones; the resolution check covers raw reports too.
   const blockingIssues = Array.isArray(report.onboardingDecision?.blockingIssues)
     ? report.onboardingDecision.blockingIssues : [];
   const coveredFields = new Set();
   for (const b of blockingIssues) {
+    if (b.resolved || hasManualResolution(b.field || b.title, b.document, overrides, corrections)) continue;
     const key = String(b.field || b.title || '').trim().toLowerCase();
     if (key) coveredFields.add(key);
     issues.push({
@@ -438,7 +465,7 @@ const buildAllIssuesReportDoc = async (entries = []) => {
     const effective = normStatus(e.analysis?.review_status)
       || normStatus(e.analysis?.computed_status)
       || normStatus(e.report?.status) || 'review';
-    const { issues, optionalMissing } = collectMerchantIssues(e.report, e.overrides || []);
+    const { issues, optionalMissing } = collectMerchantIssues(e.report, e.overrides || [], e.corrections || []);
     return {
       merchant: e.merchant || {},
       analysis: e.analysis || {},

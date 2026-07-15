@@ -535,6 +535,54 @@ const refreshEffectiveVerdict = async (mid) => {
   };
 };
 
+// Rewrite a stored report so downloaded documents reflect the effective review
+// state: resolved/ignored blocking issues move to resolvedIssues, the verdict,
+// summary and counts are recomputed. Mirrors the frontend's effective decision.
+const applyEffectiveDecisionToStoredReport = (report, overrides = [], corrections = []) => {
+  const decision = report?.onboardingDecision;
+  if (!decision) return report;
+  const originalBlocking = decision.blockingIssues || [];
+  if (originalBlocking.length === 0) return report;
+
+  const annotated = originalBlocking.map((issue) => ({
+    ...issue,
+    resolved: issueHasManualResolution(issue, overrides, corrections),
+  }));
+  const remaining = annotated.filter((issue) => !issue.resolved);
+  const resolved = annotated.filter((issue) => issue.resolved);
+  if (resolved.length === 0) return report;
+
+  const canOnboard = remaining.length === 0;
+  const summary = canOnboard
+    ? `${resolved.length} blocking issue(s) were resolved or ignored with reviewer action. This merchant is now eligible for onboarding based on the effective review state.`
+    : `Onboarding is still blocked by ${remaining.length} issue(s). ${resolved.length} issue(s) were resolved or ignored with reviewer action.`;
+
+  return {
+    ...report,
+    status: canOnboard ? 'verified' : (report.status || 'review_required'),
+    blockingCount: remaining.length,
+    onboardingDecision: {
+      ...decision,
+      canOnboard,
+      outcome: canOnboard ? 'eligible' : 'blocked',
+      headline: canOnboard ? 'Eligible for onboarding' : 'Onboarding blocked',
+      summary,
+      blockingIssues: remaining,
+      resolvedIssues: resolved,
+      nextSteps: canOnboard ? [] : [...new Set(remaining.map((issue) => issue.requiredAction).filter(Boolean))],
+    },
+    ruleChecks: (report.ruleChecks || []).map((check) => (
+      check.isVerdict
+        ? {
+          ...check,
+          status: canOnboard ? 'pass' : 'fail',
+          detail: canOnboard ? 'Eligible for onboarding after reviewer fixes/ignores.' : summary,
+        }
+        : check
+    )),
+  };
+};
+
 const normalizeSystemDataForVerification = (systemData) => {
   let normalizedSystemData = systemData;
   let uploadedDocNames = [];
@@ -1613,12 +1661,18 @@ const downloadVerificationReport = async (req, res) => {
        FROM merchant_rule_overrides WHERE mid = ? ORDER BY created_at`,
       [mid]
     );
+    const corrections = await loadCorrectionsForMid(mid).catch(() => []);
+
+    // The stored report carries the raw engine verdict — apply reviewer
+    // ignores/corrections so the document matches what the UI shows.
+    report = applyEffectiveDecisionToStoredReport(report, overrides || [], corrections);
 
     const buffer = await buildVerificationReportDoc({
       merchant: merchant || { mid },
       analysis,
       report,
       overrides: overrides || [],
+      corrections,
     });
 
     const safeName = String((merchant && merchant.merchant_business_name) || `merchant_${mid}`)
@@ -1681,6 +1735,8 @@ const downloadAllIssuesReport = async (req, res) => {
       overridesByMid.get(key).push(ov);
     }
 
+    const correctionsByMid = await getCorrectionsByMid(mids);
+
     const entries = analyses.map((analysis) => {
       let report = analysis.validation_json;
       if (typeof report === 'string') {
@@ -1688,11 +1744,14 @@ const downloadAllIssuesReport = async (req, res) => {
       }
       report = report && typeof report === 'object' ? report : {};
       const key = String(analysis.mid);
+      const overrides = overridesByMid.get(key) || [];
+      const corrections = correctionsByMid.get(key) || [];
       return {
         merchant: merchantByMid.get(key) || { mid: analysis.mid },
         analysis,
-        report,
-        overrides: overridesByMid.get(key) || [],
+        report: applyEffectiveDecisionToStoredReport(report, overrides, corrections),
+        overrides,
+        corrections,
       };
     });
 
@@ -2157,4 +2216,5 @@ module.exports = {
   getExtractionCorrections, saveExtractionCorrection, deleteExtractionCorrection,
   // exported for offline verdict regression testing
   normalizeSystemDataForVerification, getRequirementRulesForMerchantType,
+  applyEffectiveDecisionToStoredReport,
 };
